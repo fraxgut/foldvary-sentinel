@@ -92,4 +92,3 @@ Note that FRED data (especially `WALCL`) updates weekly, not daily. The 20-day S
 ## Licence
 
 AGPL-3.0
-

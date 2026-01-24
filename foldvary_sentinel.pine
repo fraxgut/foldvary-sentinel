@@ -143,4 +143,3 @@ bgcolor(s_solvency ? color.new(color.red, 80) : na, title="Solvency Crisis")
 bgcolor(s_entry_btc ? color.new(color.green, 80) : na, title="BTC Entry Signal")
 bgcolor(s_entry_wpm ? color.new(color.lime, 80) : na, title="WPM Entry Signal")
 
-

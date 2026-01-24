@@ -31,4 +31,3 @@ jobs:
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           STATE_GIST_ID: ${{ secrets.STATE_GIST_ID }}
         run: python sentinel.py
-
