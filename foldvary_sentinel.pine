@@ -1,0 +1,145 @@
+// © @fraxgut
+// @version=6
+
+indicator("Foldvary Master Sentinel", overlay=true)
+
+// ==========================================
+// SECTION A: DATA INGESTION (THE EYES)
+// ==========================================
+
+// 1. Bond Market & Volatility
+t_10y       = request.security("TVC:US10Y", "D", close)
+t_02y       = request.security("TVC:US02Y", "D", close)
+i_move      = request.security("TVC:MOVE", "D", close)
+i_spread    = request.security("FRED:BAMLH0A0HYM2", "D", close)
+
+// 2. Stock Market & Volatility
+p_spx       = request.security("SP:SPX", "D", close)
+p_vix       = request.security("TVC:VIX", "D", close)
+
+// 3. Commodities
+p_oil       = request.security("TVC:USOIL", "D", close)
+p_gold      = request.security("TVC:GOLD", "D", close)
+p_copper    = request.security("COMEX:HG1!", "D", close)
+
+// 4. Assets (Targets)
+p_wpm       = request.security("NYSE:WPM", "D", close)
+vol_wpm     = request.security("NYSE:WPM", "D", volume)
+p_btc       = request.security("BINANCE:BTCUSDT", "D", close)
+
+// 5. Liquidity & Fed Plumbing
+f_rrp       = request.security("FRED:RRPONTSYD", "D", close)
+f_bal       = request.security("FRED:WALCL", "D", close)
+f_tga       = request.security("FRED:WTREGEN", "D", close)
+i_dxy       = request.security("TVC:DXY", "D", close)
+
+// ==========================================
+// SECTION B: DERIVED CALCULATIONS (THE BRAIN)
+// ==========================================
+
+// 1. Bond Panic Checks
+rsi_10y       = ta.rsi(t_10y, 14)
+
+// 2. Net Liquidity
+net_liq       = f_bal - (f_tga + f_rrp)
+net_liq_sma   = ta.sma(net_liq, 20)
+net_liq_cross = ta.crossover(net_liq, net_liq_sma)
+
+// 3. Chilean Canary
+ratio_cg      = p_copper / p_gold
+
+// 4. S&P 500 Logic
+spx_high_50     = ta.highest(p_spx, 50)
+spx_low_20      = ta.lowest(p_spx, 20)
+rsi_spx         = ta.rsi(p_spx, 14)
+rsi_spx_high_50 = ta.highest(rsi_spx, 50)
+
+// 5. Gold Logic
+gold_high_20    = ta.highest(p_gold, 20)
+
+// 6. WPM Logic
+avg_vol_wpm     = ta.sma(vol_wpm, 20)
+wpm_rsi         = ta.rsi(p_wpm, 14)
+wpm_crash       = p_wpm < p_wpm[1] * 0.95
+
+// 7. Bitcoin Logic
+btc_rsi         = ta.rsi(p_btc, 14)
+
+// ==========================================
+// SECTION C: SCENARIO TRIGGERS (THE JUDGMENT)
+// ==========================================
+
+// SCENARIO 1: THE BOND VIGILANTE
+bool s_vigilante = (t_10y > 5.5) and (rsi_10y > 70) and (i_move > 130)
+
+// SCENARIO 2: THE SUGAR CRASH
+bool s_sugar = (p_spx >= spx_high_50) and (rsi_spx < rsi_spx_high_50) and (p_vix < 13)
+
+// SCENARIO 3: WAR ECONOMY
+bool s_war = (p_oil > 95) and (p_gold > gold_high_20[1]) and (p_spx < spx_low_20[1])
+
+// SCENARIO 4: SOLVENCY EVENT
+bool s_solvency = (i_spread > 5.0)
+
+// SCENARIO 5: CHILEAN DEATH
+bool s_clp_death = (i_dxy > 107) and (t_10y > 4.2)
+
+// SCENARIO 6A: SNIPER ENTRY - WHEATON
+bool s_entry_wpm = wpm_crash and (wpm_rsi < 30) and (vol_wpm > avg_vol_wpm * 2)
+
+// SCENARIO 6B: SNIPER ENTRY - BITCOIN
+bool s_entry_btc = net_liq_cross and (btc_rsi < 60)
+
+// ==========================================
+// SECTION D: PAYLOAD CONSTRUCTION (THE VOICE)
+// ==========================================
+
+var string event_msg = "NORMAL"
+
+if s_solvency
+    event_msg := "SOLVENCY_DEATH"
+else if s_entry_wpm
+    event_msg := "BUY_WPM_NOW"
+else if s_entry_btc
+    event_msg := "BUY_BTC_NOW"
+else if s_vigilante
+    event_msg := "BOND_FREEZE"
+else if s_clp_death
+    event_msg := "CLP_DEVALUATION"
+else if s_war
+    event_msg := "WAR_PROTOCOL"
+else if s_sugar
+    event_msg := "SUGAR_CRASH"
+else
+    event_msg := "DAILY_REPORT" // Heartbeat mode
+
+// ==========================================
+// SECTION E: THE JSON PAYLOAD
+// ==========================================
+// Uses "#.##" format to keep the JSON clean and readable.
+
+string json_payload = "{" +
+  "'event': '" + event_msg + "'," +
+  "'us10y': " + str.tostring(t_10y, "#.##") + "," +
+  "'dxy': " + str.tostring(i_dxy, "#.##") + "," +
+  "'spread': " + str.tostring(i_spread, "#.##") + "," +
+  "'net_liquidity': " + str.tostring(net_liq / 1000000000, "#.##") + "B," + // Converted to Billions
+  "'wpm_price': " + str.tostring(p_wpm, "#.##") + "," +
+  "'wpm_rsi': " + str.tostring(wpm_rsi, "#.##") + "," +
+  "'btc_price': " + str.tostring(p_btc, "#") +
+  "}"
+
+// FIRE ALWAYS (Once per day)
+alert(json_payload, alert.freq_once_per_bar_close)
+
+// ==========================================
+// VISUAL DEBUGGING
+// ==========================================
+
+plot(net_liq, title="Net Liquidity (Billions)", color=color.blue)
+plot(net_liq_sma, title="Net Liq SMA 20", color=color.orange)
+
+bgcolor(s_solvency ? color.new(color.red, 80) : na, title="Solvency Crisis")
+bgcolor(s_entry_btc ? color.new(color.green, 80) : na, title="BTC Entry Signal")
+bgcolor(s_entry_wpm ? color.new(color.lime, 80) : na, title="WPM Entry Signal")
+

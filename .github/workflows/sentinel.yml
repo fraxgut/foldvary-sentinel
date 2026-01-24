@@ -1,0 +1,33 @@
+name: Foldvary Sentinel
+
+on:
+  schedule:
+    # Run every 4 hours Mon-Fri (explicit hours more reliable than */4)
+    - cron: '0 0,4,8,12,16,20 * * 1-5'
+  workflow_dispatch: # Allows manual trigger button
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Sentinel
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          STATE_GIST_ID: ${{ secrets.STATE_GIST_ID }}
+        run: python sentinel.py
