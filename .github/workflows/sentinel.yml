@@ -24,6 +24,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run Sentinel
+        id: sentinel
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
@@ -31,3 +32,14 @@ jobs:
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           STATE_GIST_ID: ${{ secrets.STATE_GIST_ID }}
         run: python sentinel.py
+
+      - name: Notify on Failure
+        if: failure()
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_CHAT_ID}" \
+            -d "parse_mode=HTML" \
+            -d "text=⚠️ <b>GitHub Actions Failed</b>%0A%0ATrigger: ${{ github.event_name }}%0ATime: $(date -u '+%Y-%m-%d %H:%M UTC')%0A%0ACheck: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
