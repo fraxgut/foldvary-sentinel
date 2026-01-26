@@ -5,6 +5,8 @@ on:
     # Run every 4 hours Mon-Fri (explicit hours more reliable than */4)
     - cron: '0 0,4,8,12,16,20 * * 1-5'
   workflow_dispatch: # Allows manual trigger button
+  repository_dispatch: # Allows external cron services to trigger via API
+    types: [sentinel-run]
 
 jobs:
   scan:
