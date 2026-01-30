@@ -291,45 +291,58 @@ def get_data():
     else:
         data = pd.DataFrame()
 
-    # SPX Fallback Logic
-    # Check if ^SPX is missing or all NaN
-    spx_missing = True
-    if "^SPX" in data.columns and not data["^SPX"].dropna().empty:
-        spx_missing = False
-
-    if spx_missing:
-        print("⚠️ WARNING: ^SPX data missing or invalid. Attempting fallback to SPY...")
-        spy_data = download_with_backoff(["SPY"], start_date, end_date)
+    # --- FALLBACK SYSTEM ---
+    def process_fallback(target, backup, name):
+        """Checks if target is missing and tries to fetch backup."""
+        is_missing = True
+        if target in data.columns and not data[target].dropna().empty:
+            is_missing = False
         
-        if not spy_data.empty:
-            # Extract Close for SPY
-            if isinstance(spy_data.columns, pd.MultiIndex):
-                # Access via ('Close', 'SPY') if possible, or just index into Close
-                if 'Close' in spy_data.columns and 'SPY' in spy_data['Close'].columns:
-                     spy_series = spy_data['Close']['SPY']
-                else:
-                     # Fallback for weird shapes
-                     spy_series = spy_data.iloc[:, 0]
-            elif 'Close' in spy_data.columns:
-                spy_series = spy_data['Close']
-            else:
-                spy_series = spy_data.iloc[:, 0]
+        if is_missing:
+            print(f"⚠️ WARNING: {target} ({name}) missing. Attempting fallback to {backup}...")
+            backup_data = download_with_backoff([backup], start_date, end_date)
             
-            # Inject as ^SPX
-            data["^SPX"] = spy_series
-            print("✅ FALLBACK SUCCESS: SPY data injected as ^SPX proxy.")
-        else:
-            print("❌ FALLBACK FAILED: SPY data also unavailable.")
+            if not backup_data.empty:
+                # Extract Close series safely
+                if isinstance(backup_data.columns, pd.MultiIndex):
+                    # Try to find 'Close' -> 'Ticker'
+                    if 'Close' in backup_data.columns and backup in backup_data['Close'].columns:
+                        series = backup_data['Close'][backup]
+                    else:
+                        series = backup_data.iloc[:, 0] # Best guess
+                elif 'Close' in backup_data.columns:
+                    series = backup_data['Close']
+                else:
+                    series = backup_data.iloc[:, 0]
+                
+                # Inject into main dataframe
+                data[target] = series
+                print(f"✅ FALLBACK SUCCESS: {backup} injected as {target} proxy.")
+            else:
+                print(f"❌ FALLBACK FAILED: {backup} also unavailable.")
 
-    # Fetch WPM separately for Volume data.
+    # Apply Fallbacks for Critical Sensors
+    process_fallback("^SPX", "SPY", "S&P 500")        # SPY ETF as proxy for Index
+    process_fallback("BTC-USD", "BTC=F", "Bitcoin")   # Futures as proxy for Spot
+    process_fallback("CL=F", "BZ=F", "Crude Oil")     # Brent as proxy for WTI
+    process_fallback("^TNX", "^TYX", "10Y Yield")     # 30Y Yield as proxy for 10Y
+    process_fallback("^VIX", "^VXO", "VIX")           # VXO (OEX Vol) as proxy for VIX
+    process_fallback("GC=F", "GLD", "Gold")           # ETF as proxy
+    process_fallback("SI=F", "SLV", "Silver")         # ETF as proxy
+    process_fallback("HG=F", "CPER", "Copper")        # ETF as proxy
+    process_fallback("HRC=F", "SLX", "Steel")         # ETF as proxy
+    process_fallback("ITA", "XAR", "Defense")         # ETF as proxy
+
+    # Fetch WPM separately for Volume data with RETRY logic
     try:
-        wpm_raw = yf.download("WPM", start=start_date, end=end_date, progress=False)
+        wpm_raw = download_with_backoff(["WPM"], start_date, end_date)
         wpm_raw = wpm_raw.ffill()
         if isinstance(wpm_raw.columns, pd.MultiIndex):
             wpm_full = wpm_raw.droplevel(1, axis=1)
         else:
             wpm_full = wpm_raw
-    except:
+    except Exception as e:
+        print(f"WPM Download Error: {e}")
         wpm_full = pd.DataFrame()
 
     # FRED Data (Macro Plumbing)
