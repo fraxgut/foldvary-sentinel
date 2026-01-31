@@ -44,7 +44,10 @@ def load_state():
             "SOLVENCY_DEATH": [],
             "SUGAR_CRASH": [],
             "EM_CURRENCY_STRESS": [],
-            "WAR_PROTOCOL": []
+            "WAR_PROTOCOL": [],
+            "INTERBANK_STRESS": [],
+            "LABOUR_SHOCK": [],
+            "FLASH_MOVE": []
         },
         "daily_alerts": {
             "date": datetime.now().strftime("%Y-%m-%d"),
@@ -69,6 +72,9 @@ def load_state():
         # Ensure recent_signals exists (migration for old state files)
         if "recent_signals" not in state:
             state["recent_signals"] = default_state["recent_signals"]
+        else:
+            for key in default_state["recent_signals"]:
+                state["recent_signals"].setdefault(key, [])
 
         # Ensure daily_alerts exists and is for today (reset if new day)
         today_str = datetime.now().strftime("%Y-%m-%d")
@@ -148,7 +154,10 @@ def add_signal_to_history(state, signal_name, current_date):
             "SOLVENCY_DEATH": [],
             "SUGAR_CRASH": [],
             "EM_CURRENCY_STRESS": [],
-            "WAR_PROTOCOL": []
+            "WAR_PROTOCOL": [],
+            "INTERBANK_STRESS": [],
+            "LABOUR_SHOCK": [],
+            "FLASH_MOVE": []
         }
 
     if signal_name not in state["recent_signals"]:
@@ -261,6 +270,18 @@ def download_with_backoff(tickers, start, end, retries=3):
             time.sleep(wait)
     return pd.DataFrame()
 
+def normalize_tnx(series):
+    """
+    Normalize ^TNX units if Yahoo returns yield * 10.
+    Heuristic: if median > 20, assume scaled and divide by 10.
+    """
+    if series is None or series.empty:
+        return series
+    median_val = series.median(skipna=True)
+    if pd.notna(median_val) and median_val > 20:
+        return series / 10.0
+    return series
+
 
 def get_data():
     """
@@ -302,6 +323,10 @@ def get_data():
             data = raw_data.copy()
     else:
         data = pd.DataFrame()
+
+    # Normalize TNX unit scale if needed
+    if "^TNX" in data.columns:
+        data["^TNX"] = normalize_tnx(data["^TNX"])
 
     # --- FALLBACK SYSTEM ---
     def process_fallback(target, backup, name):
@@ -464,7 +489,7 @@ def calculate_percentile_threshold(series, window=250, percentile=95):
 
 
 # --- THE LOGIC CORE ---
-def analyze_market(df, wpm_df, fred_df, housing_df, state):
+def analyse_market(df, wpm_df, fred_df, housing_df, state):
     """
     Analyses raw data against the Foldvary parameters.
     Also checks for exit signals if positions are held.
@@ -486,7 +511,7 @@ def analyze_market(df, wpm_df, fred_df, housing_df, state):
     wpm = get_latest("WPM")
 
     # Critical Outage Check: These are mandatory for the core model logic.
-    critical = {"us10y": us10y, "spx": spx, "btc": btc}
+    critical = {"us10y": us10y, "spx": spx}
     missing = [k for k, v in critical.items() if v is None]
     if missing:
         return {"event": "DATA_OUTAGE", "missing": missing}
@@ -515,7 +540,7 @@ def analyze_market(df, wpm_df, fred_df, housing_df, state):
     icsa_current = None
     icsa_4w_avg = None
     icsa_6m_low = None
-    labor_shock = False
+    labour_shock = False
 
     if not fred_df.empty and "ICSA" in fred_df.columns:
         icsa_series = fred_df["ICSA"].dropna()
@@ -524,9 +549,12 @@ def analyze_market(df, wpm_df, fred_df, housing_df, state):
             icsa_4w_avg = icsa_series.rolling(window=20).mean().iloc[-1]  # 4 weeks * 5 days
             icsa_6m_low = icsa_series.rolling(window=26 * 5).min().iloc[-1]
 
-            # Trigger: 4-week avg rising >20% from 6-month low = labor market deterioration
-            if icsa_4w_avg > icsa_6m_low * 1.2:
-                labor_shock = True
+            # Trigger: Adaptive Z-Score (Mean + 2.0 StdDev over 1 year)
+            # Replaces arbitrary fixed % thresholds with statistical anomaly detection.
+            icsa_threshold, icsa_zscore = calculate_z_score_threshold(icsa_series, window=250, num_std=2.0)
+
+            if icsa_threshold and icsa_4w_avg > icsa_threshold:
+                labour_shock = True
 
     # SOFR vs Fed Funds (interbank stress indicator)
     sofr = None
@@ -618,10 +646,24 @@ def analyze_market(df, wpm_df, fred_df, housing_df, state):
             delinq_rising = False
 
         # HOUSING_BUST trigger:
-        # Housing starts have declined >15% from 12-month max while mortgage
-        # rates are elevated (>6.5%). This signals the construction cycle is
-        # rolling over - the core Foldvary bust mechanism.
-        housing_bust = houst_decline_pct > 15 and mortgage_rate > 6.5
+        # Housing starts collapsing statistically (Z-Score < -1.5) while rates are rising
+        # Replaces fixed 15% decline and 6.5% rate with statistical deviation logic.
+        
+        # Calculate Z-Score for Housing Starts (detect abnormal weakness)
+        # Data is daily (ffilled), so 2-year lookback = ~504 trading days
+        if len(houst) >= 252:
+            houst_window = houst.rolling(window=504) # 2 year lookback for housing cycle
+            houst_mean = houst_window.mean().iloc[-1]
+            houst_std = houst_window.std().iloc[-1]
+            houst_zscore = (houst_current - houst_mean) / houst_std if houst_std > 0 else 0
+        else:
+            houst_zscore = 0
+            
+        # Housing Bust: Starts are 1.5 deviations BELOW mean AND Rates > 52-week Avg
+        # This confirms "Weak Construction" + "Tightening Credit" relative to recent history
+        rate_52w_avg = housing_df["MORTGAGE30US"].rolling(window=252).mean().iloc[-1] if "MORTGAGE30US" in housing_df.columns else 6.0
+        
+        housing_bust = houst_zscore < -1.5 and mortgage_rate > rate_52w_avg
     else:
         mortgage_rate = 0
         houst_current = 0
@@ -631,6 +673,8 @@ def analyze_market(df, wpm_df, fred_df, housing_df, state):
         delinq_current = 0
         delinq_rising = False
         housing_bust = False
+        houst_zscore = 0
+        rate_52w_avg = 0
 
     # Stress score (calculated early for use in later logic)
     stress_score = 0
@@ -641,7 +685,7 @@ def analyze_market(df, wpm_df, fred_df, housing_df, state):
     if spx_rsi_val < 30 or spx_rsi_val > 70: stress_score += 1
     if housing_bust: stress_score += 2
     if delinq_rising: stress_score += 1
-    if labor_shock: stress_score += 2
+    if labour_shock: stress_score += 2
     if interbank_stress: stress_score += 2
 
     # --- ADAPTIVE THRESHOLDS ---
@@ -685,7 +729,32 @@ def analyze_market(df, wpm_df, fred_df, housing_df, state):
         ))
         stress_score += 3  # Maximum stress
 
-    # PRIORITY 2: TEMPORAL_CRISIS (signals within 30 days of each other)
+    # PRIORITY 2: DEPRESSION WATCH (systemic combos within 30 days)
+    # Top combos from depression proxy analysis
+    depression_alert_fired = False
+    if check_temporal_combo(state, "SUGAR_CRASH", "INTERBANK_STRESS", window_days=30) and check_temporal_combo(state, "SUGAR_CRASH", "FLASH_MOVE", window_days=30):
+        active_triggers.append((
+            "DEPRESSION_ALERT",
+            "⚠️ VIGILANCIA DEPRESIÓN: Euforia + Estrés Interbancario + Shock de Volatilidad (30d)"
+        ))
+        stress_score += 3
+        depression_alert_fired = True
+    elif check_temporal_combo(state, "SUGAR_CRASH", "INTERBANK_STRESS", window_days=30):
+        active_triggers.append((
+            "DEPRESSION_WATCH",
+            "⚠️ VIGILANCIA DEPRESIÓN: Euforia + Estrés Interbancario (30d)"
+        ))
+        stress_score += 2
+        depression_alert_fired = True
+    elif check_temporal_combo(state, "SUGAR_CRASH", "LABOUR_SHOCK", window_days=30):
+        active_triggers.append((
+            "DEPRESSION_WATCH",
+            "⚠️ VIGILANCIA DEPRESIÓN: Euforia + Deterioro Laboral (30d)"
+        ))
+        stress_score += 2
+        depression_alert_fired = True
+
+    # PRIORITY 3: TEMPORAL_CRISIS (signals within 30 days of each other)
     # SUGAR_CRASH + EM_CURRENCY_STRESS: 89% crash accuracy (28 occurrences)
     # SOLVENCY_DEATH + WAR_PROTOCOL: 82% crash accuracy (22 occurrences)
     temporal_combo_fired = False
@@ -709,19 +778,26 @@ def analyze_market(df, wpm_df, fred_df, housing_df, state):
         if spread > 5.0 and spread_3d_confirm:
             active_triggers.append(("SOLVENCY_DEATH", f"CRÍTICO: Spread de Crédito ({spread}%) > 5.0%"))
     if wpm_crash and wpm_rsi_val < 30 and wpm_vol > (wpm_vol_avg * 2):
-        active_triggers.append(("BUY_WPM_NOW", "Oportunidad WPM: Crash >5% + Volumen 2x"))
+        # Additional check: Bollinger Band Lower Break (Statistical Cheapness)
+        # Calculates dynamic lower band (Mean - 2*StdDev) to confirm price is statistically low
+        wpm_series = df["WPM"]
+        wpm_bb_mean = wpm_series.rolling(window=20).mean().iloc[-1]
+        wpm_bb_std = wpm_series.rolling(window=20).std().iloc[-1]
+        wpm_lower_band = wpm_bb_mean - (2 * wpm_bb_std)
+        
+        if wpm_val < wpm_lower_band:
+            active_triggers.append(("BUY_WPM_NOW", f"Oportunidad WPM: Ruptura Banda Bollinger Inferior ({wpm_lower_band:.2f}) + Volumen 2x"))
     if net_liquidity > net_liq_sma and net_liq_prev < net_liq_sma_prev and btc_rsi_val < 60:
         active_triggers.append(("BUY_BTC_NOW", "Pivote Fed: Liquidez Neta cruzando al alza"))
     if housing_bust:
-        reason_housing = f"Ciclo Foldvary: Inicios de Construcción -{houst_decline_pct:.0f}% + Hipotecas {mortgage_rate:.1f}%"
+        reason_housing = f"Ciclo Foldvary: Inicios Construcción débil (Z-Score {houst_zscore:.1f}σ) + Hipotecas sobre media anual ({rate_52w_avg:.1f}%)"
         if delinq_rising:
             reason_housing += " + Morosidad al alza"
         active_triggers.append(("HOUSING_BUST", reason_housing))
 
-    # LABOR_SHOCK - unemployment claims spiking
-    if labor_shock and icsa_4w_avg and icsa_6m_low:
-        rise_pct = ((icsa_4w_avg / icsa_6m_low) - 1) * 100
-        active_triggers.append(("LABOR_SHOCK", f"Mercado Laboral: Claims subiendo {rise_pct:.0f}% desde mínimo 6M"))
+    # LABOUR_SHOCK - unemployment claims spiking
+    if labour_shock and icsa_4w_avg and icsa_zscore:
+        active_triggers.append(("LABOUR_SHOCK", f"Mercado Laboral: Claims en percentil {icsa_zscore:.1f}σ (Ruptura estadística)"))
 
     # INTERBANK_STRESS - SOFR above Fed Funds
     if interbank_stress and sofr and fed_funds:
@@ -735,11 +811,16 @@ def analyze_market(df, wpm_df, fred_df, housing_df, state):
         # Fallback to fixed threshold if insufficient data for adaptive
         active_triggers.append(("BOND_FREEZE", f"Pánico en Bonos: US10Y ({us10y}%) > 5.5% (umbral fijo)"))
 
-    # EM_CURRENCY_STRESS - FIXED threshold (DXY > 107)
-    # Backtest shows 86% crash prediction accuracy with fixed threshold vs 40% with adaptive
-    # DXY > 107 is a structural stress point for EM debt service, not just statistical elevation
-    if dxy and dxy > 107 and us10y and us10y > 4.2:
-        active_triggers.append(("EM_CURRENCY_STRESS", f"Estrés Cambiario EM: DXY ({dxy:.1f}) > 107 + US10Y ({us10y}%)"))
+    # EM_CURRENCY_STRESS - Adaptive Percentile Threshold
+    # Replaces fixed 107 with 95th percentile over 1 year
+    # Replaces fixed 4.2% US10Y with "Above 250-day Moving Average" (Trend Filter)
+    us10y_sma_250 = df["^TNX"].rolling(window=250).mean().iloc[-1] if "^TNX" in df.columns and len(df) >= 250 else 4.2
+    
+    if dxy_threshold and dxy and dxy > dxy_threshold and us10y and us10y > us10y_sma_250:
+        active_triggers.append(("EM_CURRENCY_STRESS", f"Estrés Cambiario EM: DXY ({dxy:.1f}) en percentil {dxy_percentile:.0f}% + US10Y > SMA250 ({us10y_sma_250:.2f}%)"))
+    elif not dxy_threshold and dxy and dxy > 107 and us10y and us10y > 4.2:
+         # Fallback to fixed threshold if insufficient data
+        active_triggers.append(("EM_CURRENCY_STRESS", f"Estrés Cambiario EM: DXY ({dxy:.1f}) > 107 (Umbral fijo)"))
 
     # WAR_PROTOCOL - Adaptive threshold for oil, but keep the correlation check
     # Note: Backtest showed this is a poor predictor (20% win rate), but keeping with adaptive threshold
@@ -838,36 +919,64 @@ def analyze_market(df, wpm_df, fred_df, housing_df, state):
         ]
         stress_level = "CRÍTICO (Simulacro)"
 
-    # Determine Final Event and Reason
+    # Determine Final Event and Reason (prioritize depression watch / combo signals)
     if not active_triggers:
         event = "NORMAL"
         reason = "Revisión Diaria."
-    elif len(active_triggers) == 1:
-        event = active_triggers[0][0]
-        reason = active_triggers[0][1]
     else:
-        event = "MULTIPLE_CRISIS"
-        reasons_list = [t[1] for t in active_triggers]
-        reason = "MÚLTIPLES ALERTAS: " + " | ".join(reasons_list)
+        priority = ["COMBO_CRISIS", "DEPRESSION_ALERT", "DEPRESSION_WATCH", "TEMPORAL_CRISIS"]
+        selected = None
+        for p in priority:
+            for t in active_triggers:
+                if t[0] == p:
+                    selected = t
+                    break
+            if selected:
+                break
 
-    # State updates: record entry prices on BUY, clear on SELL, track crisis signals
+        if selected:
+            event = selected[0]
+            primary_reason = selected[1]
+            other_reasons = [t[1] for t in active_triggers if t[0] != event]
+            reason = primary_reason if not other_reasons else primary_reason + " | " + " | ".join(other_reasons)
+        elif len(active_triggers) == 1:
+            event = active_triggers[0][0]
+            reason = active_triggers[0][1]
+        else:
+            event = "MULTIPLE_CRISIS"
+            reasons_list = [t[1] for t in active_triggers]
+            reason = "MÚLTIPLES ALERTAS: " + " | ".join(reasons_list)
+
+    # State updates: record entry prices on BUY, clear on SELL (even if multiple signals fire)
+    event_set = {evt for evt, _ in active_triggers}
     state_update = {}
-    if event == "BUY_WPM_NOW":
-        state_update["wpm_entry_price"] = wpm_val
-        state_update["last_buy_ts"] = datetime.utcnow().isoformat()
-    elif event == "BUY_BTC_NOW":
-        state_update["btc_entry_price"] = btc
-        state_update["last_buy_ts"] = datetime.utcnow().isoformat()
-    elif event == "SELL_WPM_NOW":
-        state_update["wpm_entry_price"] = None
-    elif event == "SELL_BTC_NOW":
-        state_update["btc_entry_price"] = None
-    elif event == "SELL_ALL_NOW":
+
+    sell_all = "SELL_ALL_NOW" in event_set
+    sell_wpm = "SELL_WPM_NOW" in event_set
+    sell_btc = "SELL_BTC_NOW" in event_set
+    buy_wpm = "BUY_WPM_NOW" in event_set
+    buy_btc = "BUY_BTC_NOW" in event_set
+
+    if sell_all:
         state_update["wpm_entry_price"] = None
         state_update["btc_entry_price"] = None
+    else:
+        if sell_wpm:
+            state_update["wpm_entry_price"] = None
+        elif buy_wpm:
+            state_update["wpm_entry_price"] = wpm_val
+
+        if sell_btc:
+            state_update["btc_entry_price"] = None
+        elif buy_btc:
+            state_update["btc_entry_price"] = btc
+
+    if (buy_wpm and not sell_wpm and not sell_all) or (buy_btc and not sell_btc and not sell_all):
+        state_update["last_buy_ts"] = datetime.utcnow().isoformat()
 
     # Track crisis signals for temporal combo detection
-    tracked_signals = ["SOLVENCY_DEATH", "SUGAR_CRASH", "EM_CURRENCY_STRESS", "WAR_PROTOCOL"]
+    tracked_signals = ["SOLVENCY_DEATH", "SUGAR_CRASH", "EM_CURRENCY_STRESS", "WAR_PROTOCOL",
+                       "INTERBANK_STRESS", "LABOUR_SHOCK", "FLASH_MOVE"]
     for trigger_event, _ in active_triggers:
         if trigger_event in tracked_signals:
             add_signal_to_history(state, trigger_event, end_date)
@@ -919,39 +1028,25 @@ def generate_alert_text(data):
     # Build clean data payload (exclude internal fields)
     market_data = {k: v for k, v in data.items() if k not in ("state_update",)}
 
-    prompt = f"""Eres el <b>Centinela Foldvary</b>, un sistema de alerta de crisis macroeconómica basado en la síntesis Austro-Georgista (Fred Foldvary, ciclo de 18 años de la tierra).
-
-Tu misión: detectar el agotamiento del ciclo crediticio y la inminencia de un colapso. No eres un bot de trading genérico - eres un sistema de defensa patrimonial.
+    prompt = f"""Eres el <b>Centinela F2628</b>, un sistema de defensa patrimonial y alerta de crisis macroeconómica. Tu misión es detectar el agotamiento del ciclo de deuda y la inminencia de un colapso sistémico. La función principal es vigilancia de depresión; las señales de trading son auxiliares.
 
 FECHA: {today_str}
 EVENTO DETECTADO: {event}
 DATOS DEL SISTEMA: {market_data}
 
 ═══════════════════════════════════════
-GLOSARIO DE ACTIVOS
+MARCO TEÓRICO (Resumen Ejecutivo)
 ═══════════════════════════════════════
-- WPM: Wheaton Precious Metals (streaming minero, sensible a tasas reales). NO es "Wealth Preservation Metric".
-- ITA: ETF de Defensa/Armamento. Proxy de gasto bélico estatal.
-- HRC: Futuros de Acero Laminado. Proxy de construcción e infraestructura (bienes de capital de orden superior en la estructura austriaca).
-- Spread HY: Diferencial de crédito High Yield vs Treasuries. Amplificación = mercado exigiendo prima por riesgo de impago.
-- Liquidez Neta: Balance Fed - (TGA + RRP). El combustible monetario real del sistema.
-- HOUST: Inicios de Construcción (miles/mes). Variable CENTRAL del Ciclo Foldvary.
-- Case-Shiller: Índice Nacional de Precios de Vivienda (rezago ~2 meses).
-- ICSA: Initial Jobless Claims semanal. Indicador más rápido de recesión (lidera payrolls 2-4 meses).
-- SOFR: Secured Overnight Financing Rate. Tasa interbancaria con colateral.
-- DFF: Fed Funds Rate efectiva.
-
-═══════════════════════════════════════
-MARCO TEÓRICO: CICLO FOLDVARY
-═══════════════════════════════════════
-Fase 1 - AUGE: Crédito artificialmente barato fomenta malinversiones en proyectos de largo plazo (minería, construcción, tech). Euforia en Acero, Cobre, SPX.
-Fase 2 - ESPECULACIÓN: La renta de la tierra se dispara. Oro, Plata, WPM suben por búsqueda de rentas. Precios inmobiliarios se desacoplan de la economía real.
-Fase 3 - QUIEBRE: No hay ahorro real para completar los proyectos. Spreads explotan, VIX sube, activos de riesgo colapsan. Los últimos en entrar son los que más pierden.
+Fase 1 - AUGE: Crédito barato fomenta malinversión.
+Fase 2 - ESPECULACIÓN: Burbujas de activos, euforia y búsqueda de rentas.
+Fase 3 - QUIEBRE: Colapso de liquidez y recesión estructural.
 
 ═══════════════════════════════════════
 FORMATO DE RESPUESTA
 ═══════════════════════════════════════
 REGLAS ESTRICTAS:
+- PROHIBIDO: Usar la palabra "Foldvary". NUNCA menciones este nombre ni el "Ciclo de Foldvary" en el mensaje público.
+- Tono: Profesional, técnico pero masificado (accesible).
 - Formato: SOLO HTML de Telegram (<b>, <i>, <u>, saltos de línea).
 - PROHIBIDO: Markdown (*, #, _, `, ```, -). Ni un solo carácter de Markdown.
 - Idioma: Español formal, técnico. Sin anglicismos innecesarios.
@@ -966,6 +1061,7 @@ IMPORTANTE: Entre cada sección usa EXACTAMENTE UN salto de línea (no dos).
 4. <b><u>Estado del Sistema</u></b>
    - <b>Estrés:</b> {{stress_level}}
    - <b>Señal:</b> {{reason}}
+   {"- <b>Vigilancia Depresión:</b> " + ("ALERTA (riesgo sistémico prolongado)" if event == "DEPRESSION_ALERT" else "WATCH (fragilidad estructural)") if event in ("DEPRESSION_ALERT", "DEPRESSION_WATCH") else ""}
    {"- <b>Evento Macro:</b> " + str(data.get('macro_event')) if data.get('macro_event') else ""}
    [UN salto de línea]
 5. <b><u>Mercados</u></b>
@@ -981,8 +1077,9 @@ IMPORTANTE: Entre cada sección usa EXACTAMENTE UN salto de línea (no dos).
    - Si BUY_WPM_NOW o SELL_WPM_NOW: subraya <u><b>WPM:</b> $X (RSI X) ⚠️</u>
    - Si FLASH_MOVE: subraya el/los activo(s) que se movieron >5%
    - Si HOUSING_BUST: subraya métricas inmobiliarias relevantes
-   - Si LABOR_SHOCK: menciona en análisis (no hay métrica ICSA en lista principal)
+   - Si LABOUR_SHOCK: menciona en análisis (no hay métrica ICSA en lista principal)
    - Si INTERBANK_STRESS: menciona en análisis (no hay métrica SOFR en lista principal)
+   - Si DEPRESSION_ALERT/DEPRESSION_WATCH: subraya <u><b>S&P 500</b></u>, <u><b>VIX</b></u> y <u><b>Spread Crédito HY</b></u> como proxy de fragilidad
 
    Lista de métricas (aplica indicadores según reglas arriba):
    - <b>S&P 500:</b> {data.get('spx')}
@@ -1007,9 +1104,9 @@ IMPORTANTE: Entre cada sección usa EXACTAMENTE UN salto de línea (no dos).
    - <b>Morosidad:</b> {data.get('delinquency_rate')}%
    [UN salto de línea]
 6. <b><u>Análisis</u></b>
-   Párrafo(s) de análisis. Comienza con la fecha: "{today_str} -". Conecta los datos con la fase del ciclo Foldvary (Auge, Especulación, o Quiebre). Identifica qué fase estamos transitando. Varía la redacción cada día. Si hay macro_event, úsalo como contexto.
+   Párrafo(s) de análisis. Comienza con la fecha: "{today_str} -". Conecta los datos con la fase del ciclo (Auge, Especulación, o Quiebre). Identifica qué fase estamos transitando. Varía la redacción cada día. Si hay macro_event, úsalo como contexto.
 
-   IMPORTANTE: NO menciones códigos internos de señales (HOUSING_BUST, SOLVENCY_DEATH, etc.) en el análisis. NUNCA digas "la señal X no se activó". Habla como un economista, no como un script.
+   IMPORTANTE: NO menciones códigos internos de señales (HOUSING_BUST, SOLVENCY_DEATH, etc.) en el análisis. NUNCA digas "la señal X no se activó". Habla como un economista, no como un script. NUNCA digas "Foldvary".
 
    GUÍA DE ESTILO Y VOCABULARIO (STRICT COMPLIANCE REQUIRED)
    ---------------------------------------------------------
@@ -1018,16 +1115,18 @@ IMPORTANTE: Entre cada sección usa EXACTAMENTE UN salto de línea (no dos).
    TABLA DE TRADUCCIÓN OBLIGATORIA:
    ❌ CÓDIGO INTERNO (PROHIBIDO) | ✅ LENGUAJE NATURAL (USAR ESTO)
    ------------------------------|--------------------------------
-   HOUSING_BUST                  | "Colapso de la construcción", "giro del ciclo inmobiliario", "paralización de obras", "crisis de vivienda".
-   SOLVENCY_DEATH                | "Crisis de crédito", "cierre del grifo de financiación", "pánico en deuda corporativa".
+   HOUSING_BUST                  | "Giro del ciclo inmobiliario", "paralización de obras", "crisis de vivienda".
+   SOLVENCY_DEATH                | "Estrés de crédito", "cierre del grifo de financiación", "pánico en deuda corporativa".
    SUGAR_CRASH                   | "Trampa alcista", "euforia artificial", "divergencia técnica severa".
    BOND_FREEZE                   | "Pánico en renta fija", "desplome de bonos", "disparada de rendimientos".
-   WAR_PROTOCOL                  | "Riesgo geopolítico", "shock de oferta en energía", "temor a conflicto global".
+   WAR_PROTOCOL                  | "Riesgo de conflicto", "shock de oferta en energía", "incertidumbre geopolítica".
    EM_CURRENCY_STRESS            | "Asfixia de emergentes", "super-dólar destructivo", "crisis de balanza de pagos".
-   LABOR_SHOCK                   | "Deterioro del empleo", "aumento del desempleo", "debilidad laboral".
+   LABOUR_SHOCK                  | "Deterioro del empleo", "aumento del desempleo", "debilidad laboral".
    INTERBANK_STRESS              | "Desconfianza bancaria", "tensión de liquidez", "estrés en el mercado repo".
    COMBO_CRISIS                  | "Tormenta perfecta", "colapso sistémico simultáneo", "crisis de liquidez y solvencia".
    TEMPORAL_CRISIS               | "Convergencia de riesgos", "deterioro acelerado en múltiples frentes".
+   DEPRESSION_WATCH              | "vigilancia de depresión", "riesgo sistémico prolongado".
+   DEPRESSION_ALERT              | "alerta de depresión", "riesgo de colapso prolongado".
    FLASH_MOVE                    | "Movimiento violento", "shock de volatilidad", "ajuste repentino".
    BUY_WPM_NOW                   | "Oportunidad en activos reales", "punto de entrada en streaming", "capitulación en metales".
    BUY_BTC_NOW                   | "Giro de liquidez favorable", "expansión monetaria detectada".
@@ -1037,14 +1136,15 @@ IMPORTANTE: Entre cada sección usa EXACTAMENTE UN salto de línea (no dos).
    ❌ MAL: "No se activó la señal HOUSING_BUST gracias a los inicios de construcción."
    ✅ BIEN: "El sector inmobiliario se mantiene estable, con los inicios de construcción sosteniendo el ciclo actual."
 
-   ❌ MAL: "Detectamos un SUGAR_CRASH en el mercado."
-   ✅ BIEN: "El mercado muestra una peligrosa euforia técnica que no se corresponde con los fundamentales."
+   ❌ MAL: "Estamos en la Fase 2 del Ciclo Foldvary."
+   ✅ BIEN: "Estamos en una fase de especulación del ciclo económico."
 
    ❌ MAL: "La señal SOLVENCY_DEATH está apagada."
    ✅ BIEN: "Los mercados de crédito operan con normalidad, sin estrés visible en la financiación corporativa."
 
    En estado NORMAL: Análisis breve (3-5 líneas) sobre posición en el ciclo y riesgos latentes.
    En CRISIS: Análisis extenso explicando la mecánica del riesgo, comparaciones históricas, y qué vigilar.
+   En DEPRESSION_ALERT/WATCH: enfatiza horizonte de meses/trimestres, contracción prolongada, y fragilidad de crédito; evita lenguaje de trading táctico.
 
 IMPORTANTE: Genera EXACTAMENTE UN mensaje completo. NO generes dos versiones ni variantes.
 
@@ -1052,15 +1152,18 @@ IMPORTANTE: Genera EXACTAMENTE UN mensaje completo. NO generes dos versiones ni 
 TÍTULOS POR EVENTO
 ═══════════════════════════════════════
 - NORMAL → <b>👁‍🗨 Sistemas Nominales</b>
+- MULTIPLE_CRISIS → <b>🚨 ALERTA MÚLTIPLE | RIESGO SISTÉMICO</b>
+- DEPRESSION_ALERT → <b>🛑 ALERTA DEPRESIÓN | RIESGO SISTÉMICO</b>
+- DEPRESSION_WATCH → <b>⚠️ VIGILANCIA DEPRESIÓN | FRAGILIDAD ESTRUCTURAL</b>
 - COMBO_CRISIS → <b>🔴🔴🔴 ALERTA MÁXIMA | CRISIS INMINENTE 🔴🔴🔴</b>
-- TEMPORAL_CRISIS → <b>⚠️ ALERTA ALTA | CONVERGENCIA DE CRISIS</b>
-- SOLVENCY_DEATH → <b>🚨 ALARMA | ☠️ ALERTA DE SOLVENCIA</b>
-- EM_CURRENCY_STRESS → <b>🚨 ALARMA | 💱 ESTRÉS CAMBIARIO (EM)</b>
-- WAR_PROTOCOL → <b>🚨 ALARMA | ⚔️ PROTOCOLO DE GUERRA</b>
+- TEMPORAL_CRISIS → <b>⚠️ ALERTA ALTA | CONVERGENCIA DE RIESGOS</b>
+- SOLVENCY_DEATH → <b>🚨 ALARMA | ☠️ ESTRÉS DE CRÉDITO</b>
+- EM_CURRENCY_STRESS → <b>🚨 ALARMA | 💱 ASFIXIA DE MERCADOS (EM)</b>
+- WAR_PROTOCOL → <b>🚨 ALARMA | ⚔️ PROTOCOLO DE CONFLICTO</b>
 - BOND_FREEZE → <b>🚨 ALARMA | 🧊 CONGELAMIENTO DE BONOS</b>
 - SUGAR_CRASH → <b>🚨 ALARMA | 🍬 EUFORIA TERMINAL</b>
-- HOUSING_BUST → <b>🚨 ALARMA | 🏚️ CICLO FOLDVARY ACTIVADO</b>
-- LABOR_SHOCK → <b>🚨 ALARMA | 📉 DETERIORO LABORAL</b>
+- HOUSING_BUST → <b>🚨 ALARMA | 🏚️ GIRO DEL CICLO INMOBILIARIO</b>
+- LABOUR_SHOCK → <b>🚨 ALARMA | 📉 DETERIORO LABORAL</b>
 - INTERBANK_STRESS → <b>🚨 ALARMA | 🏦 ESTRÉS INTERBANCARIO</b>
 - FLASH_MOVE → <b>⚡ ALERTA | MOVIMIENTO SÚBITO</b>
 - BUY_WPM_NOW → <b>🎯 SEÑAL DE ENTRADA | WPM</b>
@@ -1070,65 +1173,71 @@ TÍTULOS POR EVENTO
 - SELL_ALL_NOW → <b>🚨 LIQUIDACIÓN TOTAL | EXIT ALL</b>
 
 ═══════════════════════════════════════
-INSTRUCCIONES POR SEÑAL (con precisión histórica)
+INSTRUCCIONES POR SEÑAL (basadas en evidencia estadística 2011-2026)
 ═══════════════════════════════════════
 
-<b>COMBO_CRISIS</b> [Precisión: 100%, 11/11]
-La señal más letal del sistema. NUNCA se ha equivocado. Detecta: mercado en máximos con VIX < 13 (euforia) MIENTRAS spreads de crédito > 5% por 3+ días (crédito congelado). Es la "tormenta perfecta": todos quieren vender, nadie puede refinanciar, no hay compradores.
-Tono: MÁXIMA ALARMA. Compara con Lehman 2008. Menciona: margin calls masivos, venta forzada institucional, imposibilidad de refinanciar, contagio sistémico. Esta señal exige acción inmediata.
+<b>COMBO_CRISIS</b> [Precisión Crash: Alta]
+Detecta euforia (VIX bajo) + congelamiento de crédito (Spread > 5%). Históricamente precede correcciones severas o estancamiento.
+Tono: MÁXIMA ALARMA. La divergencia entre optimismo bursátil y realidad crediticia es insostenible. Riesgo de liquidación forzada.
 
-<b>TEMPORAL_CRISIS</b> [Precisión: 82-89%]
-Dos señales críticas dispararon en los últimos 30 días (no necesariamente el mismo día). La convergencia temporal indica escalada de riesgo.
-- SUGAR_CRASH + EM_CURRENCY_STRESS (89%): Mercado complaciente mientras el dólar estrangula a EM. Contagio inesperado.
-- SOLVENCY_DEATH + WAR_PROTOCOL (82%): Crisis de crédito + shock geopolítico. Doble golpe: financiamiento congelado + commodities en caos.
-Tono: Serio y preventivo. La convergencia es más peligrosa que señales aisladas.
+<b>TEMPORAL_CRISIS</b> [Precisión Crash: Media-Alta]
+Convergencia de dos fracturas estructurales en <30 días.
+- SUGAR + EM STRESS: Euforia local vs Asfixia global (Dólar). El mercado ignora el riesgo sistémico externo.
+- SOLVENCY + WAR: Crédito caro + Shock energético. Estanflación inminente.
+Tono: Serio y preventivo. La acumulación de fallas estructurales aumenta la fragilidad del sistema.
 
-<b>WAR_PROTOCOL</b> [Precisión: 88%, 8 señales]
-Petróleo alto (z-score > 2σ) + Oro en máximo 20d + SPX en mínimo 20d. Señal geopolítica: el mercado huele guerra o disrupción de suministro.
-Tono: Grave. Menciona: shock de oferta, estanflación, destrucción de márgenes, recesión por costos. Históricamente devastador para equities en los 90 días siguientes.
+<b>DEPRESSION_ALERT / DEPRESSION_WATCH</b> [Señal de riesgo prolongado]
+Combinación de euforia bursátil con estrés de financiación y/o deterioro laboral.
+Tono: Estructural, de ciclo largo. Advierte sobre probabilidad de contracción profunda y prolongada.
+REGLAS ADICIONALES DEPRESIÓN:
+- No enmarcar como oportunidad de trading.
+- Hablar de restricción crediticia, contracción del consumo, deterioro del empleo y desinversión.
+- Usar lenguaje de horizonte largo (trimestres, no días).
 
-<b>EM_CURRENCY_STRESS</b> [Precisión: 86%, 105 señales]
-DXY > 107 + US10Y > 4.2%. El dólar fuerte estrangula a economías emergentes con deuda en USD.
-Tono: Alarma alta. Segunda mejor señal del sistema. Menciona: fuga de capitales de EM, carry trade unwinding, presión sobre CLP/BRL/MXN, servicio de deuda insostenible, riesgo de contagio a desarrollados.
+<b>WAR_PROTOCOL</b> [Precisión Crash: 64% | Retorno 90d: +0.9%]
+La señal geopolítica más efectiva. Petróleo disparado (Z-Score > 2) + Oro arriba + SPX abajo.
+Tono: BAJISTA / GRAVE. El mercado está valorando un conflicto real. Históricamente, el SPX sufre o se estanca en los siguientes 90 días.
 
-<b>BOND_FREEZE</b> [Precisión: 42%, 234 señales]
-Rendimiento US10Y supera su z-score (media + 2σ sobre 250 días) + RSI > 70 (sobrecomprado). El mercado de bonos está en pánico vendedor.
-Tono: Precaución. Menciona: endurecimiento financiero, mayores costos de financiamiento, presión sobre hipotecas y corporativos, posible crisis de refinanciamiento.
+<b>EM_CURRENCY_STRESS</b> [Precisión Crash: 49% | Retorno 90d: +0.0%]
+DXY en percentil 95 + US10Y en tendencia alcista. El "freno de mano" de la economía global.
+Tono: ALERTA DE ESTRANGULAMIENTO. Históricamente, el retorno del SPX a 90 días es PLANO (0%). No es necesariamente un crash, sino un techo de mercado. La liquidez global se seca.
 
-<b>SUGAR_CRASH</b> [Precisión: 32%, 302 señales]
-SPX en máximo 50d + divergencia RSI (RSI no confirma el máximo) + VIX < 13. Euforia sin fundamento técnico.
-Tono: Moderado. Señal débil por sí sola (32%), pero letal en combinación con otras. Menciona: complacencia extrema, mercado priced for perfection, vulnerable a cualquier shock. Es la calma antes de la tormenta.
+<b>BOND_FREEZE</b> [Precisión Crash: 39% | Retorno 90d: +0.9%]
+Pánico en bonos (Z-Score > 2).
+Tono: PRECAUCIÓN. Señala volatilidad, pero no siempre caída sostenida. A menudo es una oportunidad de compra si la Fed interviene para calmar el mercado de deuda.
 
-<b>SOLVENCY_DEATH</b> [Precisión: 22%, 777 señales]
-Spread HY > 5% por 3+ días consecutivos. El mercado de crédito exige prima de riesgo elevada.
-Tono: Cauteloso. Señal frecuente y ruidosa por sí sola, pero su valor está en las combinaciones. Si dispara junto con SUGAR_CRASH (mismo día) = COMBO_CRISIS 100%. Si dispara con WAR_PROTOCOL (30 días) = TEMPORAL_CRISIS 82%. Menciona: aversión al riesgo, funding stress, empresas zombi en riesgo.
+<b>SUGAR_CRASH</b> [Precisión Crash: 35%]
+Divergencia técnica en máximos.
+Tono: MODERADO. Señal de "techo temporal". El mercado está extendido, pero sin un catalizador fundamental (como crédito o guerra), la euforia puede persistir más de lo racional.
 
-<b>HOUSING_BUST</b> [Precisión como predictor inmediato: 6%]
-Inicios de construcción cayendo >20% desde máximo 12m MIENTRAS hipoteca 30Y > 6% Y morosidad subiendo.
-IMPORTANTE: Esta NO es una señal de crash inmediato. Es un indicador ESTRUCTURAL que señala que el ciclo de 18 años de Foldvary está girando. El crash viene 1-2 años DESPUÉS de esta señal. Sirve para confirmar la fase del ciclo, no para timing.
-Tono: Analítico, no alarmista. Menciona: deterioro estructural, ciclo inmobiliario girando, confirma tesis Foldvary a largo plazo. Compara con 2006-2007 (HOUSING_BUST disparó, crash vino en 2008).
+<b>SOLVENCY_DEATH</b> [Precisión Crash: 22% | Retorno 90d: +5.0%]
+Spread HY > 5%.
+Tono: CAUTELOSO Y MATIZADO. Estructuralmente grave, pero por sí sola es una señal "contrarian" a corto plazo (el mercado rebota el 78% de las veces). Indica estrés de fondo que requiere monitoreo, pero no venta de pánico inmediata a menos que se combine con otras señales.
 
-<b>LABOR_SHOCK</b> [Precisión como predictor de crash: 7%, 155 señales | CONTRARIAN: 93% win rate, +11.2% avg retorno 90d]
-Media 4 semanas de ICSA > mínimo 6 meses * 1.2 (subida >20% en claims).
-IMPORTANTE: Esta señal es históricamente CONTRARIAN - cuando dispara, el mercado sube en los siguientes 90 días (93% win rate). NO es un predictor de crash inmediato. LABOR_SHOCK señala recesión estructural inminente, pero los mercados suelen ignorarlo inicialmente o incluso subir por expectativas de recortes de tasas de la Fed. Esta señal es un indicador económico fundamental (deterioro real) pero NO un timing de entrada bajista.
-Tono: Analítico y cauteloso. Menciona: despidos acelerándose, debilidad del consumidor, señal recesiva temprana. PERO advierte que históricamente el mercado puede subir post-señal (expecting Fed pivot). Si coincide con SOLVENCY_DEATH = crisis combinada más relevante.
+<b>HOUSING_BUST</b> [Señal Estructural de Largo Plazo]
+Construcción colapsando (-1.5σ) + Tasas subiendo.
+Tono: ANALÍTICO (Ciclo de 18 Años). Confirma que la economía real se está frenando. No esperes un crash bursátil mañana, pero sí una recesión en 12-18 meses. Es el "canario en la mina" del ciclo Foldvary.
 
-<b>INTERBANK_STRESS</b> [Precisión como predictor de crash: 21%, 92 señales | CONTRARIAN: 79% win rate, +4.2% avg retorno 90d]
-SOFR > Fed Funds + 10bps. Los bancos se cobran prima entre sí - no confían en sus contrapartes.
-IMPORTANTE: Esta señal es también históricamente CONTRARIAN - cuando dispara, el mercado tiende a subir en los siguientes 90 días (79% win rate). Esto probablemente refleja que SOFR spikes son temporales (liquidez overnight normaliza rápido) o que la Fed interviene. NO es un crash predictor confiable por sí solo.
-Tono: Cauto. Menciona: tensión interbancaria, pero aclara que históricamente no precede caídas inmediatas. SOFR spikes pueden ser ruido técnico del mercado de repos. Solo es relevante en COMBINACIÓN con otros signos sistémicos (ej: SOLVENCY_DEATH + INTERBANK_STRESS = validación cruzada de funding stress).
+<b>LABOUR_SHOCK</b> [WIN RATE CONTRARIAN: 93% | Retorno 90d: +6.0%]
+Desempleo disparándose (>2σ).
+IMPORTANTE: El mercado SUBE el 93% de las veces tras esta señal.
+Tono: ANALÍTICO Y "BULLISH" (por liquidez). La economía real sufre, pero Wall Street celebra esperando el rescate de la Fed (Pivot). No asustes a los usuarios: advierte del daño económico, pero reconoce la probable respuesta alcista de los activos de riesgo.
+
+<b>INTERBANK_STRESS</b> [WIN RATE CONTRARIAN: 79%]
+SOFR > Fed Funds.
+Tono: TÉCNICO. Tensión de fontanería financiera. Al igual que Labour Shock, suele provocar inyecciones de liquidez que levantan el mercado.
 
 <b>FLASH_MOVE</b>
-Movimiento > 5% en una sesión en activos críticos (SPX, VIX, BTC, Bonos, Oil, Gold, DXY).
-Tono: Atención. No necesariamente catastrófico, pero detecta black swans que indicadores suavizados pierden. Menciona el activo, la magnitud, y posibles causas. Si múltiples activos se mueven simultáneamente, la gravedad aumenta.
+Movimiento > 5% en una sesión.
+Tono: ATENCIÓN. Shock de volatilidad. Analizar según el activo afectado.
 
-<b>BUY_WPM_NOW</b> [Win rate 90d: 44%]
-WPM cae >5% + RSI < 30 + Volumen > 2x promedio. Señal de entrada en metales preciosos.
-Tono: Oportunista pero cauteloso. Menciona: capitulación técnica en WPM, oportunidad de entrada en streaming minero, pero señal históricamente volátil. Risk/reward favorable si la tesis de ciclo se mantiene.
+<b>BUY_WPM_NOW</b> [Win Rate 90d: 57% | Retorno: +8.5%]
+WPM barato (Banda Bollinger) + Pánico.
+Tono: OPORTUNIDAD TÁCTICA. Compra contra la tendencia ("cuchillo cayendo"). Históricamente pierde dinero el primer mes, pero rinde fuerte (+8.5%) al trimestre. Paciencia requerida.
 
-<b>BUY_BTC_NOW</b> [Win rate 90d: 56%, avg +11.7%]
-Liquidez Neta cruza al alza su SMA 10d + BTC RSI < 60. El combustible monetario está girando a favor de BTC.
-Tono: Constructivo. Mejor señal de entrada del sistema. Menciona: pivot de liquidez confirmado, históricamente BTC responde a expansión de balance Fed, momentum alcista incipiente.
+<b>BUY_BTC_NOW</b> [Win Rate 90d: 56% | Retorno: +11.7%]
+Liquidez Neta subiendo + BTC descansando.
+Tono: CONSTRUCTIVO / ALCISTA. La mejor señal de entrada del sistema. Sigue el dinero de la Fed. Históricamente muy rentable (+11.7% trimestral).
 
 <b>SELL_WPM_NOW / SELL_BTC_NOW</b>
 Señales de salida (RSI sobrecomprado, objetivo alcanzado, o reversión de liquidez).
@@ -1200,7 +1309,7 @@ if __name__ == "__main__":
         print(f"Loaded state: {state}")
 
         market_data, wpm_data, fred_data, housing_data = get_data()
-        analysis = analyze_market(market_data, wpm_data, fred_data, housing_data, state)
+        analysis = analyse_market(market_data, wpm_data, fred_data, housing_data, state)
 
         print(f"Analysis Result: {analysis}")
 
