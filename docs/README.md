@@ -1,9 +1,9 @@
 # F2628 (Centinela)
 
 ## Project Overview
-**F2628** is a serverless market monitoring bot written in Python. It is designed to run automatically via GitHub Actions to analyse macro-economic anomalies based on the "18-year Cycle" framework.
+**F2628** is a serverless market monitoring bot written in Python. It runs automatically via GitHub Actions to analyse macroeconomic anomalies based on the "18-year Cycle" framework.
 
-It acts as a "Depression Detector," monitoring variables like Credit Spreads, Reverse Repo, and Bond Yields. When critical thresholds are breached, it uses the Google Gemini API to generate a stylized alert (in Spanish, utilizing a "Centinela" persona) and delivers it via Telegram.
+It acts as a "Depression Detector," monitoring variables like credit spreads, reverse repo, and bond yields. When critical thresholds are breached, it uses the Google Gemini API to generate a stylised alert (in Spanish, using a "Centinela" persona) and delivers it via Telegram.
 Trading signals exist but are auxiliary; the primary mission is depression/crisis detection.
 
 > **Note:** Fred Foldvary was the main inspiration for this project.
@@ -37,7 +37,7 @@ python sentinel.py
 
 The script executes a four-stage pipeline: **Fetch → Analyse → Generate → Notify**.
 
-Data comes from Yahoo Finance (prices, yields, volumes) and FRED (credit spreads, Fed balance sheet, RRP, TGA, SOFR, jobless claims, housing). The analysis evaluates multiple crisis and stress triggers in priority order. If any fires, Gemini generates a Spanish-language alert in a technical Spanish persona and dispatches it to Telegram.
+Data comes from Yahoo Finance (prices, yields, volumes) and FRED (credit spreads, Fed balance sheet, RRP, TGA, SOFR, jobless claims, housing). The analysis evaluates multiple crisis and stress triggers in priority order. If any fires, Gemini generates a Spanish-language alert in a technical, formal persona and dispatches it to Telegram.
 
 Normal status reports are suppressed during the day and only sent as an end-of-day heartbeat (20:00+ UTC) to avoid spam. Crisis alerts fire immediately regardless of time.
 
@@ -48,25 +48,25 @@ Normal status reports are suppressed during the day and only sent as an end-of-d
 | Event | Condition (summary) | Meaning |
 |---|---|---|
 | `COMBO_CRISIS` | `SOLVENCY_DEATH` + `SUGAR_CRASH` same day | Credit freeze + euphoria = maximum systemic risk |
-| `DEPRESSION_ALERT` | Euforia + Estrés interbancario + shock de volatilidad (30d) | Riesgo de contracción prolongada |
-| `DEPRESSION_WATCH` | Euforia + Estrés interbancario o laboral (30d) | Vigilancia de depresión |
+| `DEPRESSION_ALERT` | Euphoria + interbank stress + volatility shock (30d) | High risk of prolonged contraction |
+| `DEPRESSION_WATCH` | Euphoria + interbank or labour stress (30d) | Depression watch |
 | `TEMPORAL_CRISIS` | SUGAR+EM or SOLVENCY+WAR within 30d | Converging structural fractures |
 | `SOLVENCY_DEATH` | HY spread > 5.0% for 3+ days | Credit market freeze |
-| `HOUSING_BUST` | Housing starts < -1.5σ and rates > 52w avg | Land/housing cycle rollover |
+| `HOUSING_BUST` | Housing starts < -1.5σ and rates > 52w average | Land/housing cycle rollover |
 | `BOND_FREEZE` | US10Y > 2σ + RSI > 70 | Bond market panic |
-| `EM_CURRENCY_STRESS` | DXY 95th pct + US10Y > SMA250 (fallback DXY>107) | EM stress / USD squeeze |
-| `WAR_PROTOCOL` | Oil > 2σ + Gold high + SPX low | Geopolitical shock |
+| `EM_CURRENCY_STRESS` | DXY 95th percentile + US10Y > SMA250 (fallback DXY>107) | EM stress / USD squeeze |
+| `WAR_PROTOCOL` | Oil > 2σ + gold high + SPX low | Geopolitical shock |
 | `SUGAR_CRASH` | SPX 50d high + RSI divergence + VIX < 13 | Euphoria / late-cycle warning |
-| `LABOUR_SHOCK` | ICSA 4w avg > 2σ | Labor deterioration |
-| `INTERBANK_STRESS` | SOFR > DFF + 10bps | Funding stress |
+| `LABOUR_SHOCK` | ICSA 4w average > 2σ | Labour deterioration |
+| `INTERBANK_STRESS` | SOFR > DFF + 10 bps | Funding stress |
 | `FLASH_MOVE` | >5% single-session shock | Sudden volatility event |
 
 **Entry signals:**
 
 | Event | Condition | Action |
 |-------|-----------|--------|
-| `BUY_WPM_NOW` | WPM drops >5% + RSI < 30 + Volume > 2x avg + Bollinger lower break | Capitulation entry in Wheaton Precious Metals |
-| `BUY_BTC_NOW` | Net Liquidity crosses above 20-day SMA + BTC RSI < 60 | Fed liquidity pivot, buy Bitcoin |
+| `BUY_WPM_NOW` | WPM drops >5% + RSI < 30 + Volume > 2x average + Bollinger lower break | Capitulation entry in Wheaton Precious Metals |
+| `BUY_BTC_NOW` | Net Liquidity crosses above 10-day SMA + BTC RSI < 60 | Fed liquidity pivot, buy Bitcoin |
 
 **Exit signals** (requires state persistence setup):
 
@@ -90,6 +90,10 @@ Note that FRED data (especially `WALCL`) updates weekly, not daily. The 10-day S
 - Latest results: `output/maximalist_backtest.csv`
 - Depression proxy summary: `docs/DEPRESSION_BACKTEST_SUMMARY.md`
 - Combo analysis output: `output/combo_analysis.csv`
+- Walk-forward summary: `docs/WALKFORWARD_SUMMARY.md`
+- Regime split summary: `docs/REGIME_SPLIT_SUMMARY.md`
+
+Backtests now request data from 1916, but actual coverage depends on source availability (market data begins later than FRED and housing data starts in 1959). The reports log the effective start dates.
 
 ## Dependencies
 

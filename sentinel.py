@@ -15,6 +15,23 @@ TG_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 GIST_TOKEN = os.environ.get("GIST_TOKEN")
 STATE_GIST_ID = os.environ.get("STATE_GIST_ID")
 DEBUG_CRISIS = False  # Set to True to test alarm formatting immediately
+MARKET_STALE_DAYS = 5
+FRED_STALE_DAYS = {
+    "BAMLH0A0HYM2": 7,    # HY spread (daily)
+    "RRPONTSYD": 7,       # RRP (daily)
+    "WALCL": 14,          # Fed balance sheet (weekly)
+    "WTREGEN": 7,         # TGA (daily)
+    "ICSA": 14,           # Weekly claims
+    "SOFR": 7,            # Daily
+    "DFF": 7,             # Daily
+    "USREC": 45           # Monthly-ish
+}
+HOUSING_STALE_DAYS = {
+    "MORTGAGE30US": 14,   # Weekly
+    "HOUST": 45,          # Monthly
+    "CSUSHPINSA": 75,     # Monthly with lag
+    "DRSFRMACBS": 120     # Quarterly
+}
 
 # Initialize the new Client
 client = genai.Client(api_key=GEMINI_KEY)
@@ -247,7 +264,46 @@ def get_macro_event(date):
         "2026-12-16": "FOMC Decision",
     }
 
-    return events.get(date_str, None)
+    max_year = max(int(k.split("-")[0]) for k in events.keys())
+    calendar_warning = None
+    if date.year > max_year:
+        calendar_warning = f"Calendario macro desactualizado (último año {max_year})"
+
+    return events.get(date_str, None), calendar_warning
+
+
+def collect_stale_data(df, fred_df, housing_df, end_date):
+    """
+    Detects stale series based on last available date by asset class.
+    Returns a list of warnings for any series beyond the freshness threshold.
+    """
+    warnings = []
+
+    def check_series(series, name, max_age_days):
+        if series is None or series.dropna().empty:
+            return
+        last_date = series.dropna().index.max()
+        if last_date is None:
+            return
+        age_days = (end_date.date() - last_date.date()).days
+        if age_days > max_age_days:
+            warnings.append(f"{name} rezagado (último {last_date.date()})")
+
+    if not df.empty:
+        for col in df.columns:
+            check_series(df[col], col, MARKET_STALE_DAYS)
+
+    if not fred_df.empty:
+        for series_name, max_days in FRED_STALE_DAYS.items():
+            if series_name in fred_df.columns:
+                check_series(fred_df[series_name], series_name, max_days)
+
+    if not housing_df.empty:
+        for series_name, max_days in HOUSING_STALE_DAYS.items():
+            if series_name in housing_df.columns:
+                check_series(housing_df[series_name], series_name, max_days)
+
+    return warnings
 
 
 # --- DATA FETCHING ---
@@ -515,6 +571,8 @@ def analyse_market(df, wpm_df, fred_df, housing_df, state):
     missing = [k for k, v in critical.items() if v is None]
     if missing:
         return {"event": "DATA_OUTAGE", "missing": missing}
+
+    data_warnings = collect_stale_data(df, fred_df, housing_df, end_date)
 
     # Safe Defaults for Auxiliary Metrics (Updated for 2026 Baseline)
     # Uses these ONLY if primary AND backup feeds fail completely.
@@ -981,6 +1039,8 @@ def analyse_market(df, wpm_df, fred_df, housing_df, state):
         if trigger_event in tracked_signals:
             add_signal_to_history(state, trigger_event, end_date)
 
+    macro_event, calendar_warning = get_macro_event(end_date)
+
     return {
         "event": event,
         "reason": reason,
@@ -1013,7 +1073,9 @@ def analyse_market(df, wpm_df, fred_df, housing_df, state):
         "icsa_6m_low": round(icsa_6m_low, 0) if icsa_6m_low else None,
         "sofr": round(sofr, 2) if sofr else None,
         "fed_funds": round(fed_funds, 2) if fed_funds else None,
-        "macro_event": get_macro_event(end_date),
+        "macro_event": macro_event,
+        "calendar_warning": calendar_warning,
+        "data_warnings": "; ".join(data_warnings) if data_warnings else None,
     }
 
 
@@ -1063,6 +1125,8 @@ IMPORTANTE: Entre cada sección usa EXACTAMENTE UN salto de línea (no dos).
    - <b>Señal:</b> {{reason}}
    {"- <b>Vigilancia Depresión:</b> " + ("ALERTA (riesgo sistémico prolongado)" if event == "DEPRESSION_ALERT" else "WATCH (fragilidad estructural)") if event in ("DEPRESSION_ALERT", "DEPRESSION_WATCH") else ""}
    {"- <b>Evento Macro:</b> " + str(data.get('macro_event')) if data.get('macro_event') else ""}
+   {"- <b>Calendario Macro:</b> " + str(data.get('calendar_warning')) if data.get('calendar_warning') else ""}
+   {"- <b>Datos Rezagados:</b> " + str(data.get('data_warnings')) if data.get('data_warnings') else ""}
    [UN salto de línea]
 5. <b><u>Mercados</u></b>
    IMPORTANTE: Muestra EXACTAMENTE estas métricas en este orden, SIEMPRE (sin agregar ni quitar).

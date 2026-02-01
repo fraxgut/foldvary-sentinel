@@ -9,10 +9,14 @@ from datetime import datetime, timedelta
 import time
 import numpy as np
 import os
+from pathlib import Path
 from fpdf import FPDF
 
 # --- CONFIGURATION ---
 LOOKBACK_YEARS = 15
+HISTORICAL_START_DATE = "1916-01-01"
+BACKTEST_START_DATE = os.environ.get("BACKTEST_START_DATE")
+BACKTEST_TAG = os.environ.get("BACKTEST_TAG")
 FORWARD_WINDOWS = [30, 90, 180]
 TEMPORAL_WINDOW_DAYS = 30
 DEDUP_DAYS = 30
@@ -64,29 +68,54 @@ def normalize_tnx(series):
 # --- DATA FETCHING ---
 def fetch_historical_data():
     end_date = datetime.now()
-    start_date = end_date - timedelta(days=LOOKBACK_YEARS * 365)
+    if BACKTEST_START_DATE:
+        start_date = datetime.strptime(BACKTEST_START_DATE, "%Y-%m-%d")
+    elif HISTORICAL_START_DATE:
+        start_date = datetime.strptime(HISTORICAL_START_DATE, "%Y-%m-%d")
+    else:
+        start_date = end_date - timedelta(days=LOOKBACK_YEARS * 365)
     print(f"Fetching data from {start_date.date()} to {end_date.date()}...")
 
-    tickers = ["^TNX", "^SPX", "^VIX", "CL=F", "GC=F", "SI=F", "HG=F", "HRC=F", "ITA", "DX-Y.NYB", "WPM", "BTC-USD"]
-    
-    try:
-        raw = yf.download(tickers, start=start_date, end=end_date, progress=False, group_by='ticker')
-        market_df = pd.DataFrame()
-        for ticker in tickers:
+    tickers = ["^TNX", "^SPX", "^GSPC", "^VIX", "CL=F", "GC=F", "SI=F", "HG=F", "HRC=F", "ITA", "DX-Y.NYB", "WPM", "BTC-USD"]
+
+    def download_series(ticker, start, end, retries=3):
+        delays = [3, 7, 15]
+        for attempt in range(retries + 1):
             try:
-                if ticker in raw.columns.levels[0]:
-                    market_df[ticker] = raw[ticker]['Close']
-                    if ticker == "WPM":
-                        market_df["WPM_Volume"] = raw[ticker]['Volume']
-                elif 'Close' in raw.columns and ticker in raw['Close'].columns:
-                     market_df[ticker] = raw['Close'][ticker]
-            except Exception: pass
-        market_df = market_df.ffill()
-        if "^TNX" in market_df.columns:
-            market_df["^TNX"] = normalize_tnx(market_df["^TNX"])
-    except Exception as e:
-        print(f"YF Error: {e}")
-        return None, None, None
+                df = yf.download(ticker, start=start, end=end, progress=False)
+                if not df.empty:
+                    return df
+            except Exception as e:
+                print(f"YF download error ({ticker}) attempt {attempt+1}: {e}")
+            if attempt < retries:
+                time.sleep(delays[min(attempt, len(delays) - 1)])
+        return pd.DataFrame()
+
+    market_df = pd.DataFrame()
+    for ticker in tickers:
+        df = download_series(ticker, start_date, end_date)
+        if df.empty:
+            print(f"YF missing: {ticker}")
+            continue
+        if "Close" in df.columns:
+            market_df[ticker] = df["Close"]
+        elif "Adj Close" in df.columns:
+            market_df[ticker] = df["Adj Close"]
+        else:
+            market_df[ticker] = df.iloc[:, 0]
+        if ticker == "WPM" and "Volume" in df.columns:
+            market_df["WPM_Volume"] = df["Volume"]
+
+    market_df = market_df.ffill()
+    if "^SPX" not in market_df.columns or market_df["^SPX"].dropna().empty:
+        if "^GSPC" in market_df.columns and not market_df["^GSPC"].dropna().empty:
+            market_df["^SPX"] = market_df["^GSPC"]
+    if "^TNX" in market_df.columns:
+        market_df["^TNX"] = normalize_tnx(market_df["^TNX"])
+    if not market_df.empty:
+        actual_start = market_df.dropna(how="all").index.min()
+        if actual_start is not None:
+            print(f"Market data start: {actual_start.date()}")
 
     try:
         fred_df = web.DataReader(
@@ -95,12 +124,20 @@ def fetch_historical_data():
             start_date,
             end_date,
         ).ffill()
+        if not fred_df.empty:
+            actual_start = fred_df.dropna(how="all").index.min()
+            if actual_start is not None:
+                print(f"FRED data start: {actual_start.date()}")
     except Exception as e:
         print(f"FRED Error: {e}")
         fred_df = pd.DataFrame()
 
     try:
         housing_df = web.DataReader(["HOUST", "MORTGAGE30US", "CSUSHPINSA", "DRSFRMACBS"], "fred", start_date, end_date).ffill()
+        if not housing_df.empty:
+            actual_start = housing_df.dropna(how="all").index.min()
+            if actual_start is not None:
+                print(f"Housing data start: {actual_start.date()}")
     except Exception as e:
         print(f"FRED Housing Error: {e}")
         housing_df = pd.DataFrame()
@@ -131,7 +168,8 @@ def analyse_date(market_df, fred_df, housing_df, idx, history_log):
     gold = get_last(m_win, "GC=F") or 2000
     vix = get_last(m_win, "^VIX") or 15
     
-    if us10y is None or spx is None: return [], []
+    if us10y is None or spx is None:
+        return [], history_log, {}
 
     # Calculated
     btc_rsi = rsi(m_win["BTC-USD"]).iloc[-1] if "BTC-USD" in m_win.columns else 50
@@ -425,7 +463,7 @@ class DetailedPDF(FPDF):
         self.set_font('Lexend', '', 8)
         self.cell(0, 10, f'Page {self.page_no()}/{{nb}}', 0, 0, 'C')
 
-def generate_maximalist_report(results, market_df):
+def generate_maximalist_report(results, market_df, pdf_path):
     pdf = DetailedPDF()
     pdf.alias_nb_pages()
     pdf.add_page()
@@ -609,8 +647,147 @@ def generate_maximalist_report(results, market_df):
             
             pdf.ln(4)
 
-    pdf.output("comprehensive_backtest_report.pdf")
-    print("PDF Generated: comprehensive_backtest_report.pdf")
+    pdf.output(str(pdf_path))
+    print(f"PDF Generated: {pdf_path}")
+
+
+def generate_walkforward_summary(results, output_dir, suffix, docs_dir):
+    """
+    Builds a walk-forward summary table by year/event using only signals
+    with a full 12-month forward window available.
+    """
+    df = results.copy()
+    if "Date" not in df.columns:
+        return
+
+    df["Date"] = pd.to_datetime(df["Date"])
+    cutoff = df["Date"].max() - timedelta(days=DEPRESSION_FORWARD_DAYS)
+    df = df[df["Date"] <= cutoff]
+    if df.empty:
+        print("Walk-forward summary skipped: insufficient forward window.")
+        return
+
+    grouped = (
+        df.groupby([df["Date"].dt.year, "Event"])
+          .agg(
+              count=("Event", "size"),
+              depression_rate=("DepressionFlag", "mean"),
+              nber_rate=("Depress_NBER_Recession", "mean"),
+              crash90=("Fwd_90d", lambda s: (s < 0).mean()),
+              win180=("Fwd_180d", lambda s: (s > 0).mean())
+          )
+          .reset_index()
+          .rename(columns={"Date": "Year"})
+    )
+
+    for col in ["depression_rate", "nber_rate", "crash90", "win180"]:
+        if col in grouped.columns:
+            grouped[col] = grouped[col] * 100
+
+    output_dir.mkdir(exist_ok=True)
+    grouped.to_csv(output_dir / f"walkforward_summary{suffix}.csv", index=False)
+
+    # Minimal markdown summary for key depression signals
+    key_events = ["DEPRESSION_ALERT", "DEPRESSION_WATCH", "COMBO_CRISIS"]
+    lines = [
+        "# Walk-Forward Summary",
+        f"**Date generated:** {datetime.now().strftime('%Y-%m-%d')}",
+        "",
+        "Summary uses only signals with a full 12-month forward window available.",
+        "Rates are computed per calendar year and then aggregated below for key signals.",
+        ""
+    ]
+
+    for ev in key_events:
+        sub = df[df["Event"] == ev]
+        if sub.empty:
+            continue
+        dep_rate = sub["DepressionFlag"].mean() * 100 if "DepressionFlag" in sub.columns else 0
+        nber_rate = sub["Depress_NBER_Recession"].mean() * 100 if "Depress_NBER_Recession" in sub.columns else 0
+        crash90 = (sub["Fwd_90d"] < 0).mean() * 100 if "Fwd_90d" in sub.columns else 0
+        win180 = (sub["Fwd_180d"] > 0).mean() * 100 if "Fwd_180d" in sub.columns else 0
+        lines.append(f"- **{ev}:** count {len(sub)}, depression {dep_rate:.1f}%, NBER {nber_rate:.1f}%, 90d crash {crash90:.1f}%, 180d win {win180:.1f}%.")
+
+    docs_dir.mkdir(exist_ok=True)
+    md_path = docs_dir / f"WALKFORWARD_SUMMARY{suffix}.md"
+    md_path.write_text("\n".join(lines) + "\n")
+
+
+def generate_regime_split_summary(results, output_dir, suffix, docs_dir):
+    """
+    Builds a rolling 5-year window summary by event.
+    Intended to show regime sensitivity of signals.
+    """
+    df = results.copy()
+    if "Date" not in df.columns:
+        return
+
+    df["Date"] = pd.to_datetime(df["Date"])
+    cutoff = df["Date"].max() - timedelta(days=DEPRESSION_FORWARD_DAYS)
+    df = df[df["Date"] <= cutoff]
+    if df.empty:
+        print("Regime split summary skipped: insufficient forward window.")
+        return
+
+    min_year = df["Date"].dt.year.min()
+    max_year = df["Date"].dt.year.max()
+
+    rows = []
+    for start_year in range(min_year, max_year - 4 + 1):
+        start_date = datetime(start_year, 1, 1)
+        end_date = datetime(start_year + 4, 12, 31)
+        window = df[(df["Date"] >= start_date) & (df["Date"] <= end_date)]
+        if window.empty:
+            continue
+        for event in window["Event"].unique():
+            sub = window[window["Event"] == event]
+            rows.append({
+                "WindowStart": start_date.strftime("%Y-%m-%d"),
+                "WindowEnd": end_date.strftime("%Y-%m-%d"),
+                "Event": event,
+                "Count": len(sub),
+                "DepressionRate": (sub["DepressionFlag"].mean() * 100) if "DepressionFlag" in sub.columns else 0,
+                "NBERRate": (sub["Depress_NBER_Recession"].mean() * 100) if "Depress_NBER_Recession" in sub.columns else 0,
+                "Crash90": (sub["Fwd_90d"] < 0).mean() * 100 if "Fwd_90d" in sub.columns else 0,
+                "Win180": (sub["Fwd_180d"] > 0).mean() * 100 if "Fwd_180d" in sub.columns else 0,
+            })
+
+    if not rows:
+        return
+
+    summary = pd.DataFrame(rows)
+    output_dir.mkdir(exist_ok=True)
+    summary.to_csv(output_dir / f"regime_split_summary{suffix}.csv", index=False)
+
+    key_events = ["DEPRESSION_ALERT", "DEPRESSION_WATCH", "COMBO_CRISIS"]
+    lines = [
+        "# Regime Split Summary",
+        f"**Date generated:** {datetime.now().strftime('%Y-%m-%d')}",
+        "",
+        "Rolling five-year windows (start year to start+4).",
+        "Only signals with a full 12-month forward window are included.",
+        ""
+    ]
+
+    for event in key_events:
+        sub = summary[summary["Event"] == event]
+        if sub.empty:
+            continue
+        lines.append(f"## {event}")
+        top = sub.sort_values(["DepressionRate", "Count"], ascending=[False, False]).head(5)
+        lines.append("| Window | Count | Depression | NBER | Crash90 | Win180 |")
+        lines.append("| --- | --- | --- | --- | --- | --- |")
+        for _, row in top.iterrows():
+            window_label = f"{row['WindowStart']} → {row['WindowEnd']}"
+            lines.append(
+                f"| {window_label} | {int(row['Count'])} | {row['DepressionRate']:.1f}% | {row['NBERRate']:.1f}% | {row['Crash90']:.1f}% | {row['Win180']:.1f}% |"
+            )
+        lines.append("")
+
+    docs_dir.mkdir(exist_ok=True)
+    md_path = docs_dir / f"REGIME_SPLIT_SUMMARY{suffix}.md"
+    md_path.write_text("\n".join(lines) + "\n")
+
 
 def run_backtest():
     market_df, fred_df, housing_df = fetch_historical_data()
@@ -661,12 +838,18 @@ def run_backtest():
 
     if results:
         df = pd.DataFrame(results)
-        df.to_csv("maximalist_backtest.csv", index=False)
-        df.to_csv("scientific_backtest.csv", index=False)
-        os.makedirs("output", exist_ok=True)
-        df.to_csv("output/maximalist_backtest.csv", index=False)
-        df.to_csv("output/scientific_backtest.csv", index=False)
-        generate_maximalist_report(df, market_df)
+        output_dir = Path("output")
+        output_dir.mkdir(exist_ok=True)
+        suffix = f"_{BACKTEST_TAG}" if BACKTEST_TAG else ""
+        docs_dir = Path("docs") if not BACKTEST_TAG else output_dir
+
+        df.to_csv(output_dir / f"maximalist_backtest{suffix}.csv", index=False)
+        df.to_csv(output_dir / f"scientific_backtest{suffix}.csv", index=False)
+
+        pdf_path = output_dir / f"comprehensive_backtest_report{suffix}.pdf"
+        generate_maximalist_report(df, market_df, pdf_path)
+        generate_walkforward_summary(df, output_dir, suffix, docs_dir)
+        generate_regime_split_summary(df, output_dir, suffix, docs_dir)
     else:
         print("No signals.")
 

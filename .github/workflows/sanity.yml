@@ -1,0 +1,30 @@
+name: Backtest Sanity Check
+
+on:
+  schedule:
+    - cron: '0 6 * * 0' # Weekly on Sunday 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  sanity:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Backtest
+        run: python backtest.py
+
+      - name: Run Sanity Checks
+        run: |
+          python scripts/sanity_check.py
+          python scripts/check_macro_calendar.py
