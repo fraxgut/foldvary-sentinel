@@ -278,30 +278,39 @@ def analyse_date(market_df, fred_df, housing_df, idx, history_log):
 
     if spx >= spx_high50 and spx_rsi < spx_rsi_high50 and vix < 13: triggers.append("SUGAR_CRASH")
 
-    ot, oz = calculate_z_score_threshold(m_win["CL=F"], 250, 2.0)
-    g_h20 = m_win["GC=F"].rolling(20).max().iloc[-2] if "GC=F" in m_win.columns else 99999
-    spx_l20 = m_win["^SPX"].rolling(20).min().iloc[-2]
-    if ot and oil > ot and gold > g_h20 and spx < spx_l20: triggers.append("WAR_PROTOCOL")
+    ot = None
+    if "CL=F" in m_win.columns:
+        ot, _ = calculate_z_score_threshold(m_win["CL=F"], 250, 2.0)
+    g_h20 = m_win["GC=F"].rolling(20).max().iloc[-2] if "GC=F" in m_win.columns and len(m_win) >= 21 else None
+    spx_l20 = m_win["^SPX"].rolling(20).min().iloc[-2] if len(m_win) >= 21 else None
+    if ot is not None and g_h20 is not None and spx_l20 is not None and oil > ot and gold > g_h20 and spx < spx_l20:
+        triggers.append("WAR_PROTOCOL")
 
-    dt, dp = calculate_percentile_threshold(m_win["DX-Y.NYB"], 250, 95)
-    us10y_sma = m_win["^TNX"].rolling(250).mean().iloc[-1] if len(m_win) > 250 else 4.2
-    if dt and dxy > dt and us10y > us10y_sma:
+    dt = None
+    if "DX-Y.NYB" in m_win.columns:
+        dt, _ = calculate_percentile_threshold(m_win["DX-Y.NYB"], 250, 95)
+    us10y_sma = m_win["^TNX"].rolling(250).mean().iloc[-1] if "^TNX" in m_win.columns and len(m_win) > 250 else 4.2
+    if dt is not None and dxy > dt and us10y > us10y_sma:
         triggers.append("EM_CURRENCY_STRESS")
-    elif not dt and dxy > 107 and us10y > 4.2:
+    elif dt is None and "DX-Y.NYB" in m_win.columns and dxy > 107 and us10y > 4.2:
         triggers.append("EM_CURRENCY_STRESS")
 
-    bt, bz = calculate_z_score_threshold(m_win["^TNX"], 250, 2.0)
-    if bt and us10y > bt and us10y_rsi > 70: triggers.append("BOND_FREEZE")
+    bt = None
+    if "^TNX" in m_win.columns:
+        bt, _ = calculate_z_score_threshold(m_win["^TNX"], 250, 2.0)
+    if bt is not None and us10y > bt and us10y_rsi > 70:
+        triggers.append("BOND_FREEZE")
 
     if not h_win.empty and "HOUST" in h_win.columns and len(h_win) > 252:
         houst = h_win["HOUST"].dropna()
-        if len(houst) > 252:
+        if len(houst) >= 504:
             h_mean = houst.rolling(504).mean().iloc[-1]
             h_std = houst.rolling(504).std().iloc[-1]
             h_z = (houst.iloc[-1] - h_mean) / h_std if h_std > 0 else 0
             m_avg = h_win["MORTGAGE30US"].rolling(252).mean().iloc[-1] if "MORTGAGE30US" in h_win.columns else 6.0
             m_cur = get_last(h_win, "MORTGAGE30US") or 6.0
-            if h_z < -1.5 and m_cur > m_avg: triggers.append("HOUSING_BUST")
+            if pd.notna(m_avg) and h_z < -1.5 and m_cur > m_avg:
+                triggers.append("HOUSING_BUST")
 
     if "ICSA" in f_win.columns:
         icsa = f_win["ICSA"].dropna()
@@ -319,14 +328,23 @@ def analyse_date(market_df, fred_df, housing_df, idx, history_log):
         w_lower = w_mean - (2 * w_std)
         w_vol = get_last(m_win, "WPM_Volume")
         w_vol_avg = m_win["WPM_Volume"].rolling(20).mean().iloc[-1]
-        if wpm < w_lower and wpm_rsi < 30 and w_vol > (w_vol_avg * 2): triggers.append("BUY_WPM_NOW")
+        if (
+            pd.notna(w_lower)
+            and wpm < w_lower
+            and wpm_rsi < 30
+            and w_vol is not None
+            and pd.notna(w_vol_avg)
+            and w_vol > (w_vol_avg * 2)
+        ):
+            triggers.append("BUY_WPM_NOW")
 
     net_liq = (get_last(f_win, "WALCL") or 0) - ((get_last(f_win, "WTREGEN") or 0) + (get_last(f_win, "RRPONTSYD") or 0))
-    if "WALCL" in f_win.columns and len(f_win) > 10:
+    if {"WALCL", "WTREGEN", "RRPONTSYD"}.issubset(f_win.columns) and len(f_win) > 10:
         nl_s = f_win["WALCL"] - (f_win["WTREGEN"] + f_win["RRPONTSYD"])
         nl_sma = nl_s.rolling(10).mean().iloc[-1]
         nl_prev = nl_s.iloc[-2]; nl_prev_sma = nl_s.rolling(10).mean().iloc[-2]
-        if net_liq > nl_sma and nl_prev < nl_prev_sma and btc_rsi < 60: triggers.append("BUY_BTC_NOW")
+        if pd.notna(nl_sma) and pd.notna(nl_prev_sma) and net_liq > nl_sma and nl_prev < nl_prev_sma and btc_rsi < 60:
+            triggers.append("BUY_BTC_NOW")
 
     # --- FLASH MOVE DETECTOR ---
     flash_tickers = {
@@ -922,7 +940,9 @@ def generate_regime_split_summary(results, output_dir, suffix, docs_dir, lang="e
 
 def run_backtest():
     market_df, fred_df, housing_df = fetch_historical_data()
-    if market_df is None: return
+    if market_df is None or market_df.empty:
+        print("No market data available for backtest.")
+        return
 
     print(f"Running Scientific Backtest on {len(market_df)} days...")
     results = []
@@ -939,6 +959,8 @@ def run_backtest():
         
         for event in triggers:
             asset = "WPM" if "WPM" in event else ("BTC-USD" if "BTC" in event else "^SPX")
+            if asset not in market_df.columns:
+                continue
             
             entry = market_df[asset].iloc[idx]
             event_detail = details.get(event)

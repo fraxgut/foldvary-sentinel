@@ -2,6 +2,7 @@ import base64
 import json
 import os
 import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -9,6 +10,10 @@ import requests
 DEFAULT_DB_PATH = os.environ.get("HISTORY_DB_PATH", os.path.join("output", "history.db"))
 DEFAULT_GIST_FILENAME = os.environ.get("HISTORY_GIST_FILENAME", "history.db.b64")
 DEFAULT_CALIBRATION_PATH = os.environ.get("REGIME_CALIBRATION_PATH", os.path.join("output", "regime_calibration.json"))
+SUPPORTED_REGIME_METHODS = {"auto", "absolute", "zscore", "percentile", "calibrated"}
+GIST_TIMEOUT_SECONDS = 20
+GIST_MAX_RETRIES = 4
+GIST_BACKOFF_BASE_SECONDS = 2
 
 COLUMNS = [
     "date",
@@ -79,26 +84,92 @@ def ensure_db(db_path):
         conn.commit()
 
 
+def _gist_request_with_retries(
+    method,
+    url,
+    *,
+    headers=None,
+    json_payload=None,
+    timeout=GIST_TIMEOUT_SECONDS,
+    retries=GIST_MAX_RETRIES,
+    operation="History gist request",
+    retry_statuses=(429, 500, 502, 503, 504),
+):
+    retries = max(1, int(retries))
+    for attempt in range(retries):
+        try:
+            response = requests.request(
+                method,
+                url,
+                headers=headers,
+                json=json_payload,
+                timeout=timeout,
+            )
+        except requests.RequestException as exc:
+            if attempt >= retries - 1:
+                raise
+            wait_time = GIST_BACKOFF_BASE_SECONDS * (2 ** attempt)
+            print(
+                f"{operation} network error: {exc}. "
+                f"Retrying in {wait_time}s ({attempt + 1}/{retries})"
+            )
+            time.sleep(wait_time)
+            continue
+
+        if response.status_code in retry_statuses and attempt < retries - 1:
+            wait_time = GIST_BACKOFF_BASE_SECONDS * (2 ** attempt)
+            print(
+                f"{operation} returned {response.status_code}. "
+                f"Retrying in {wait_time}s ({attempt + 1}/{retries})"
+            )
+            time.sleep(wait_time)
+            continue
+
+        return response
+
+    raise RuntimeError(f"{operation} failed after {retries} attempts.")
+
+
 def load_db_from_gist(gist_token, gist_id, db_path, gist_filename=None):
     if not gist_token or not gist_id:
-        return False
+        return None
 
     filename = gist_filename or get_gist_filename()
     url = f"https://api.github.com/gists/{gist_id}"
     headers = {"Authorization": f"token {gist_token}"}
 
     try:
-        response = requests.get(url, headers=headers, timeout=20)
+        response = _gist_request_with_retries(
+            "GET",
+            url,
+            headers=headers,
+            operation="History gist load",
+        )
         response.raise_for_status()
         gist_data = response.json()
         file_entry = gist_data.get("files", {}).get(filename)
-        if not file_entry or not file_entry.get("content"):
-            return False
+        if not file_entry:
+            return None
+        content = file_entry.get("content")
         if file_entry.get("truncated"):
-            print("History gist content truncated; skipping load.")
-            return False
+            raw_url = file_entry.get("raw_url")
+            if not raw_url:
+                print("History gist content truncated and raw_url missing; skipping load.")
+                return False
+            print("History gist content truncated in API response; fetching raw content.")
+            raw_response = _gist_request_with_retries(
+                "GET",
+                raw_url,
+                headers=headers,
+                operation="History gist raw load",
+            )
+            raw_response.raise_for_status()
+            content = raw_response.text
 
-        payload = base64.b64decode(file_entry["content"].encode("utf-8"))
+        if not content:
+            return None
+
+        payload = base64.b64decode(content.encode("utf-8"))
         directory = os.path.dirname(db_path)
         if directory:
             os.makedirs(directory, exist_ok=True)
@@ -121,11 +192,20 @@ def save_db_to_gist(gist_token, gist_id, db_path, gist_filename=None):
     try:
         with open(db_path, "rb") as handle:
             encoded = base64.b64encode(handle.read()).decode("utf-8")
+        if len(encoded) > 9_500_000:
+            print("History gist save skipped: encoded DB payload exceeds safe gist size.")
+            return False
 
         url = f"https://api.github.com/gists/{gist_id}"
         headers = {"Authorization": f"token {gist_token}"}
         payload = {"files": {filename: {"content": encoded}}}
-        response = requests.patch(url, headers=headers, json=payload, timeout=20)
+        response = _gist_request_with_retries(
+            "PATCH",
+            url,
+            headers=headers,
+            json_payload=payload,
+            operation="History gist save",
+        )
         response.raise_for_status()
         return True
     except Exception as exc:
@@ -312,6 +392,20 @@ def _load_calibration(path):
         float(thresholds["phase3_enter"]), float(thresholds["phase3_exit"])
     )
 
+    lookback_fallback = _get_int_env(
+        "REGIME_PCT_LOOKBACK",
+        "180",
+    ) if value_type == "percentile" else _get_int_env("REGIME_Z_LOOKBACK", "180")
+    min_samples_fallback = _get_int_env("CALIBRATION_MIN_SAMPLES", "120")
+    try:
+        lookback_days = int(payload.get("lookback_days", lookback_fallback))
+    except (TypeError, ValueError):
+        lookback_days = lookback_fallback
+    try:
+        min_samples = int(payload.get("min_samples", min_samples_fallback))
+    except (TypeError, ValueError):
+        min_samples = min_samples_fallback
+
     return {
         "value_type": value_type,
         "thresholds": {
@@ -320,6 +414,8 @@ def _load_calibration(path):
             "phase3_enter": phase3_enter,
             "phase3_exit": phase3_exit,
         },
+        "lookback_days": lookback_days,
+        "min_samples": min_samples,
     }
 
 
@@ -368,6 +464,8 @@ def _percentile_rank(values, current_value):
 
 def _select_regime_method(scores):
     method = os.environ.get("REGIME_METHOD", "auto").lower()
+    if method not in SUPPORTED_REGIME_METHODS:
+        method = "auto"
     if method != "auto":
         return method
 
@@ -383,6 +481,52 @@ def _select_regime_method(scores):
     if len(scores) >= z_min:
         return "zscore"
     return "absolute"
+
+
+def regime_history_limit(window_days, trend_days, min_days):
+    base_limit = max(
+        1,
+        window_days if window_days > 0 else 0,
+        min_days if min_days > 0 else 0,
+        (trend_days * 2) if trend_days > 0 else 0,
+    )
+
+    method = os.environ.get("REGIME_METHOD", "auto").lower()
+    if method not in SUPPORTED_REGIME_METHODS:
+        method = "auto"
+
+    z_lookback = _get_int_env("REGIME_Z_LOOKBACK", "180")
+    pct_lookback = _get_int_env("REGIME_PCT_LOOKBACK", "180")
+    z_min = _get_int_env("REGIME_AUTO_Z_MIN_SAMPLES", "90")
+    pct_min = _get_int_env("REGIME_AUTO_PCT_MIN_SAMPLES", "180")
+    calibration = _load_calibration(DEFAULT_CALIBRATION_PATH)
+
+    calibration_limit = 0
+    if calibration:
+        calibration_limit = max(
+            calibration.get("lookback_days") or 0,
+            calibration.get("min_samples") or 0,
+        )
+
+    if method == "absolute":
+        return base_limit
+    if method == "zscore":
+        return max(base_limit, z_lookback)
+    if method == "percentile":
+        return max(base_limit, pct_lookback)
+    if method == "calibrated":
+        return max(base_limit, calibration_limit, z_lookback, pct_lookback)
+
+    # auto mode: fetch enough history for automatic method selection and
+    # stable percentile/z-score calculations.
+    return max(
+        base_limit,
+        z_min,
+        pct_min,
+        z_lookback,
+        pct_lookback,
+        calibration_limit,
+    )
 
 
 def compute_regime(history_rows, window_days, trend_days, min_days):

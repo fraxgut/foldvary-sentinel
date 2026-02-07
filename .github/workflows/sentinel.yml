@@ -8,6 +8,10 @@ on:
   repository_dispatch: # Allows external cron services to trigger via API
     types: [sentinel-run]
 
+concurrency:
+  group: foldvary-sentinel-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   scan:
     runs-on: ubuntu-latest

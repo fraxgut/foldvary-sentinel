@@ -53,9 +53,10 @@ def main():
     retention_days = int(os.environ.get("HISTORY_RETENTION_DAYS", "365"))
 
     sync_gist = os.environ.get("BACKFILL_SYNC_GIST", "false").lower() == "true"
+    history_load_state = True
 
     if sync_gist and sentinel.GIST_TOKEN and sentinel.STATE_GIST_ID:
-        history_store.load_db_from_gist(
+        history_load_state = history_store.load_db_from_gist(
             sentinel.GIST_TOKEN,
             sentinel.STATE_GIST_ID,
             db_path,
@@ -129,10 +130,10 @@ def main():
         risk_window = int(os.environ.get("RISK_WINDOW_DAYS", os.environ.get("REGIME_WINDOW_DAYS", "14")))
         risk_trend = int(os.environ.get("RISK_TREND_DAYS", os.environ.get("REGIME_TREND_DAYS", "7")))
         risk_min = int(os.environ.get("RISK_MIN_DAYS", os.environ.get("REGIME_MIN_DAYS", "7")))
-        history_limit = max(
+        history_limit = history_store.regime_history_limit(
             risk_window,
+            risk_trend,
             risk_min,
-            risk_trend * 2,
         )
         history_rows = history_store.fetch_recent_history(db_path, history_limit)
         regime = history_store.compute_regime(
@@ -149,12 +150,15 @@ def main():
     history_store.prune_history(db_path, retention_days)
 
     if sync_gist and sentinel.GIST_TOKEN and sentinel.STATE_GIST_ID:
-        history_store.save_db_to_gist(
-            sentinel.GIST_TOKEN,
-            sentinel.STATE_GIST_ID,
-            db_path,
-            os.environ.get("HISTORY_GIST_FILENAME", "history.db.b64"),
-        )
+        if history_load_state is False:
+            print("History load failed earlier; skipping gist save to avoid remote overwrite.")
+        else:
+            history_store.save_db_to_gist(
+                sentinel.GIST_TOKEN,
+                sentinel.STATE_GIST_ID,
+                db_path,
+                os.environ.get("HISTORY_GIST_FILENAME", "history.db.b64"),
+            )
 
     print("Backfill complete.")
 

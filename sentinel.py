@@ -1,5 +1,7 @@
+import html
 import json
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -19,6 +21,9 @@ TG_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 GIST_TOKEN = os.environ.get("GIST_TOKEN")
 STATE_GIST_ID = os.environ.get("STATE_GIST_ID")
 DEBUG_CRISIS = False  # Set to True to test alarm formatting immediately
+HTTP_TIMEOUT_SECONDS = 20
+HTTP_MAX_RETRIES = 4
+HTTP_BACKOFF_BASE_SECONDS = 2
 MARKET_STALE_DAYS = 5
 FRED_STALE_DAYS = {
     "BAMLH0A0HYM2": 7,    # HY spread (daily)
@@ -48,6 +53,80 @@ CYCLE_STARTS_Z_MONTHS = int(os.environ.get("CYCLE_STARTS_Z_MONTHS", "60"))
 
 # Initialize the new Client (only if key is present)
 client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
+
+_HTML_TAG_RE = re.compile(r"</?[^>]+>")
+
+
+def _request_with_retries(
+    method,
+    url,
+    *,
+    headers=None,
+    json_payload=None,
+    data=None,
+    operation="HTTP request",
+    retries=HTTP_MAX_RETRIES,
+    timeout=HTTP_TIMEOUT_SECONDS,
+    retry_statuses=(429, 500, 502, 503, 504),
+):
+    retries = max(1, int(retries))
+    for attempt in range(retries):
+        try:
+            response = requests.request(
+                method,
+                url,
+                headers=headers,
+                json=json_payload,
+                data=data,
+                timeout=timeout,
+            )
+        except requests.RequestException as exc:
+            if attempt >= retries - 1:
+                raise
+            wait_time = HTTP_BACKOFF_BASE_SECONDS * (2 ** attempt)
+            print(
+                f"{operation} network error: {exc}. "
+                f"Retrying in {wait_time}s ({attempt + 1}/{retries})"
+            )
+            time.sleep(wait_time)
+            continue
+
+        if response.status_code in retry_statuses and attempt < retries - 1:
+            retry_after = response.headers.get("Retry-After")
+            wait_time = None
+            if retry_after:
+                try:
+                    wait_time = max(1, int(float(retry_after)))
+                except ValueError:
+                    wait_time = None
+            if wait_time is None:
+                wait_time = HTTP_BACKOFF_BASE_SECONDS * (2 ** attempt)
+            print(
+                f"{operation} returned {response.status_code}. "
+                f"Retrying in {wait_time}s ({attempt + 1}/{retries})"
+            )
+            time.sleep(wait_time)
+            continue
+
+        return response
+
+    raise RuntimeError(f"{operation} failed after {retries} attempts.")
+
+
+def _extract_telegram_error(response):
+    try:
+        payload = response.json()
+    except ValueError:
+        return response.text
+    return payload.get("description") or response.text
+
+
+def _telegram_plain_text(message):
+    text = message or ""
+    text = _HTML_TAG_RE.sub("", text)
+    text = html.unescape(text)
+    text = text.strip()
+    return text or "Mensaje generado sin formato."
 
 
 # --- STATE PERSISTENCE (GITHUB GIST) ---
@@ -88,16 +167,29 @@ def load_state():
     if not GIST_TOKEN or not STATE_GIST_ID:
         return default_state
 
+    url = f"https://api.github.com/gists/{STATE_GIST_ID}"
+    headers = {"Authorization": f"token {GIST_TOKEN}"}
     try:
-        url = f"https://api.github.com/gists/{STATE_GIST_ID}"
-        headers = {"Authorization": f"token {GIST_TOKEN}"}
-        response = requests.get(url, headers=headers)
+        response = _request_with_retries(
+            "GET",
+            url,
+            headers=headers,
+            operation="State load",
+        )
         response.raise_for_status()
         gist_data = response.json()
+    except Exception as e:
+        default_state["_state_load_failed"] = True
+        print(f"State load error: {e}. Using default state.")
+        return default_state
 
-        # The gist should have a file called "state.json"
-        content = gist_data["files"]["state.json"]["content"]
-        state = json.loads(content)
+    file_entry = gist_data.get("files", {}).get("state.json")
+    if not file_entry or not file_entry.get("content"):
+        print("State file missing in gist; initializing default state.")
+        return default_state
+
+    try:
+        state = json.loads(file_entry["content"])
 
         # Ensure recent_signals exists (migration for old state files)
         if "recent_signals" not in state:
@@ -116,6 +208,7 @@ def load_state():
 
         return state
     except Exception as e:
+        default_state["_state_load_failed"] = True
         print(f"State load error: {e}. Using default state.")
         return default_state
 
@@ -137,7 +230,13 @@ def save_state(state):
                 }
             }
         }
-        response = requests.patch(url, headers=headers, json=payload)
+        response = _request_with_retries(
+            "PATCH",
+            url,
+            headers=headers,
+            json_payload=payload,
+            operation="State save",
+        )
         response.raise_for_status()
         print("State saved successfully.")
     except Exception as e:
@@ -174,8 +273,30 @@ def check_temporal_combo(state, signal_a, signal_b, window_days=30):
     dates_a = state["recent_signals"].get(signal_a, [])
     dates_b = state["recent_signals"].get(signal_b, [])
 
-    # Check if either list is non-empty (meaning at least one fired recently)
-    return len(dates_a) > 0 and len(dates_b) > 0
+    if not dates_a or not dates_b:
+        return False
+
+    parsed_a = []
+    parsed_b = []
+    for date_str in dates_a:
+        try:
+            parsed_a.append(datetime.strptime(date_str, "%Y-%m-%d").date())
+        except ValueError:
+            continue
+    for date_str in dates_b:
+        try:
+            parsed_b.append(datetime.strptime(date_str, "%Y-%m-%d").date())
+        except ValueError:
+            continue
+
+    if not parsed_a or not parsed_b:
+        return False
+
+    for day_a in parsed_a:
+        for day_b in parsed_b:
+            if abs((day_a - day_b).days) <= window_days:
+                return True
+    return False
 
 
 def add_signal_to_history(state, signal_name, current_date):
@@ -1599,8 +1720,9 @@ def update_regime_context(analysis):
         return analysis
 
     try:
+        history_load_state = True
         if GIST_TOKEN and STATE_GIST_ID:
-            history_store.load_db_from_gist(
+            history_load_state = history_store.load_db_from_gist(
                 GIST_TOKEN,
                 STATE_GIST_ID,
                 HISTORY_DB_PATH,
@@ -1637,7 +1759,11 @@ def update_regime_context(analysis):
         history_store.upsert_daily_snapshot(HISTORY_DB_PATH, snapshot)
         history_store.prune_history(HISTORY_DB_PATH, HISTORY_RETENTION_DAYS)
 
-        history_limit = max(RISK_WINDOW_DAYS, RISK_MIN_DAYS, RISK_TREND_DAYS * 2)
+        history_limit = history_store.regime_history_limit(
+            RISK_WINDOW_DAYS,
+            RISK_TREND_DAYS,
+            RISK_MIN_DAYS,
+        )
         history_rows = history_store.fetch_recent_history(HISTORY_DB_PATH, history_limit)
         regime = history_store.compute_regime(history_rows, RISK_WINDOW_DAYS, RISK_TREND_DAYS, RISK_MIN_DAYS)
 
@@ -1646,12 +1772,15 @@ def update_regime_context(analysis):
         history_store.update_regime_fields(HISTORY_DB_PATH, date_str, regime)
 
         if GIST_TOKEN and STATE_GIST_ID:
-            history_store.save_db_to_gist(
-                GIST_TOKEN,
-                STATE_GIST_ID,
-                HISTORY_DB_PATH,
-                HISTORY_GIST_FILENAME,
-            )
+            if history_load_state is False:
+                print("History load failed earlier; skipping gist save to avoid remote overwrite.")
+            else:
+                history_store.save_db_to_gist(
+                    GIST_TOKEN,
+                    STATE_GIST_ID,
+                    HISTORY_DB_PATH,
+                    HISTORY_GIST_FILENAME,
+                )
     except Exception as exc:
         print(f"History store error: {exc}")
 
@@ -1661,24 +1790,55 @@ def update_regime_context(analysis):
 # --- MESSENGER (TELEGRAM) ---
 def send_telegram(message):
     """Dispatches the final message via the Telegram Bot API."""
-    if not TG_TOKEN: return None
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return None
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     payload = {"chat_id": TG_CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
-        response = requests.post(url, json=payload)
+        response = _request_with_retries(
+            "POST",
+            url,
+            json_payload=payload,
+            operation="Telegram send (HTML)",
+        )
+        if response.ok:
+            return response.json().get("result", {}).get("message_id")
+
+        description = _extract_telegram_error(response)
+        if response.status_code == 400 and "parse entities" in description.lower():
+            plain_payload = {
+                "chat_id": TG_CHAT_ID,
+                "text": _telegram_plain_text(message),
+            }
+            print("Telegram HTML parse error; retrying as plain text.")
+            fallback_response = _request_with_retries(
+                "POST",
+                url,
+                json_payload=plain_payload,
+                operation="Telegram send (plain text)",
+            )
+            fallback_response.raise_for_status()
+            return fallback_response.json().get("result", {}).get("message_id")
+
         response.raise_for_status()
-        return response.json().get("result", {}).get("message_id")
     except Exception as e:
         print(f"Telegram Failed: {e}")
         return None
 
 def pin_message(message_id):
     """Pins a critical alert in the chat."""
-    if not TG_TOKEN or not message_id: return
+    if not TG_TOKEN or not TG_CHAT_ID or not message_id:
+        return
     url = f"https://api.telegram.org/bot{TG_TOKEN}/pinChatMessage"
     payload = {"chat_id": TG_CHAT_ID, "message_id": message_id}
     try:
-        requests.post(url, json=payload)
+        response = _request_with_retries(
+            "POST",
+            url,
+            json_payload=payload,
+            operation="Telegram pin",
+        )
+        response.raise_for_status()
     except Exception as e:
         print(f"Pinning Failed: {e}")
 
@@ -1688,6 +1848,7 @@ if __name__ == "__main__":
     try:
         # Load persistent state (entry positions).
         state = load_state()
+        skip_state_save = bool(state.pop("_state_load_failed", False))
         print(f"Loaded state: {state}")
 
         market_data, wpm_data, fred_data, housing_data = get_data()
@@ -1748,8 +1909,11 @@ if __name__ == "__main__":
             print(f"Status Normal (Hour {current_hour} UTC). Keeping silent.")
 
         # Save state (positions + daily alerts history)
-        save_state(state)
-        print(f"Updated state: {state}")
+        if skip_state_save and GIST_TOKEN and STATE_GIST_ID:
+            print("State load failed earlier; skipping state save to avoid remote overwrite.")
+        else:
+            save_state(state)
+            print(f"Updated state: {state}")
 
         if should_send:
             alert_text = generate_alert_text(analysis)
