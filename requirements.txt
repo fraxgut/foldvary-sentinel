@@ -1,8 +1,8 @@
-yfinance
-numpy>=1.26.0
-pandas>=2.0.0,<2.2.0
-pandas_datareader
-requests
-google-genai
-setuptools
-fpdf2
+yfinance==1.0
+numpy==2.3.2
+pandas==2.3.3
+pandas-datareader==0.10.0
+requests==2.32.5
+google-genai==1.60.0
+setuptools==80.9.0
+fpdf2==2.8.5

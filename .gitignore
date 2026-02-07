@@ -225,6 +225,8 @@ output/regime_calibration.json
 # Test files
 test_*.py
 analyze_*.py
+!tests/
+!tests/test_*.py
 
 # Marimo
 marimo/_static/

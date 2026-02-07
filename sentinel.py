@@ -160,7 +160,8 @@ def load_state():
         },
         "daily_alerts": {
             "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-            "sent_events": []
+            "sent_events": [],
+            "sent_ops_warnings": [],
         }
     }
 
@@ -203,8 +204,11 @@ def load_state():
         if "daily_alerts" not in state or state["daily_alerts"].get("date") != today_str:
             state["daily_alerts"] = {
                 "date": today_str,
-                "sent_events": []
+                "sent_events": [],
+                "sent_ops_warnings": [],
             }
+        else:
+            state["daily_alerts"].setdefault("sent_ops_warnings", [])
 
         return state
     except Exception as e:
@@ -1719,6 +1723,8 @@ def update_regime_context(analysis):
     if not HISTORY_DB_PATH:
         return analysis
 
+    ops_warnings = list(analysis.get("ops_warnings") or [])
+
     try:
         history_load_state = True
         if GIST_TOKEN and STATE_GIST_ID:
@@ -1728,6 +1734,8 @@ def update_regime_context(analysis):
                 HISTORY_DB_PATH,
                 HISTORY_GIST_FILENAME,
             )
+            if history_load_state is False:
+                ops_warnings.append("HISTORY_GIST_LOAD_FAILED_SKIP_SAVE")
 
         history_store.ensure_db(HISTORY_DB_PATH)
 
@@ -1774,16 +1782,22 @@ def update_regime_context(analysis):
         if GIST_TOKEN and STATE_GIST_ID:
             if history_load_state is False:
                 print("History load failed earlier; skipping gist save to avoid remote overwrite.")
+                ops_warnings.append("HISTORY_GIST_SAVE_SKIPPED_DUE_LOAD_FAILURE")
             else:
-                history_store.save_db_to_gist(
+                save_ok = history_store.save_db_to_gist(
                     GIST_TOKEN,
                     STATE_GIST_ID,
                     HISTORY_DB_PATH,
                     HISTORY_GIST_FILENAME,
                 )
+                if save_ok is False:
+                    ops_warnings.append("HISTORY_GIST_SAVE_FAILED")
     except Exception as exc:
         print(f"History store error: {exc}")
+        ops_warnings.append("HISTORY_STORE_PIPELINE_ERROR")
 
+    if ops_warnings:
+        analysis["ops_warnings"] = sorted(set(ops_warnings))
     return analysis
 
 
@@ -1843,6 +1857,44 @@ def pin_message(message_id):
         print(f"Pinning Failed: {e}")
 
 
+def send_ops_warnings(state, warnings, is_manual_run=False):
+    if not warnings:
+        return
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return
+    if "daily_alerts" not in state:
+        state["daily_alerts"] = {
+            "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "sent_events": [],
+            "sent_ops_warnings": [],
+        }
+    sent_ops = state["daily_alerts"].setdefault("sent_ops_warnings", [])
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    labels = {
+        "STATE_LOAD_FAILED_SKIP_SAVE": "No se pudo cargar `state.json` desde gist; guardado remoto omitido para evitar sobreescritura.",
+        "HISTORY_GIST_LOAD_FAILED_SKIP_SAVE": "No se pudo cargar la base histórica desde gist.",
+        "HISTORY_GIST_SAVE_SKIPPED_DUE_LOAD_FAILURE": "Guardado histórico en gist omitido tras fallo de carga para evitar pérdida de datos.",
+        "HISTORY_GIST_SAVE_FAILED": "Falló el guardado de historial en gist.",
+        "HISTORY_STORE_PIPELINE_ERROR": "Error interno en el pipeline de historial/regímenes.",
+    }
+
+    for warning_code in sorted(set(warnings)):
+        if not is_manual_run and warning_code in sent_ops:
+            continue
+        description = labels.get(warning_code, warning_code)
+        ops_msg = (
+            f"<b>⚠️ AVISO OPERATIVO | CENTINELA</b>\n\n"
+            f"<b>Fecha:</b> {today_str}\n"
+            f"<b>Código:</b> {warning_code}\n"
+            f"<b>Detalle:</b> {description}\n\n"
+            f"Revise logs y sincronización de estado/historial."
+        )
+        msg_id = send_telegram(ops_msg)
+        if msg_id and warning_code not in sent_ops:
+            sent_ops.append(warning_code)
+
+
 # --- MAIN EXECUTION ---
 if __name__ == "__main__":
     try:
@@ -1866,6 +1918,9 @@ if __name__ == "__main__":
         is_manual_run = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
         should_send = False
         detected_event = analysis["event"]
+        ops_warnings = list(analysis.get("ops_warnings") or [])
+        if skip_state_save and GIST_TOKEN and STATE_GIST_ID:
+            ops_warnings.append("STATE_LOAD_FAILED_SKIP_SAVE")
 
         # --- SMART NOTIFICATION LOGIC ---
         if detected_event == "DATA_OUTAGE":
@@ -1907,6 +1962,8 @@ if __name__ == "__main__":
         
         else:
             print(f"Status Normal (Hour {current_hour} UTC). Keeping silent.")
+
+        send_ops_warnings(state, ops_warnings, is_manual_run=is_manual_run)
 
         # Save state (positions + daily alerts history)
         if skip_state_save and GIST_TOKEN and STATE_GIST_ID:
